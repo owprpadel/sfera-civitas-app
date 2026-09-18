@@ -1,0 +1,13 @@
+# Backend de Sfera Civitas en Render (capa gratuita).
+services:
+  - type: web
+    name: sfera-backend
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: SFERA_PG
+        sync: false
+      - key: SFERA_CORS
+        sync: false
