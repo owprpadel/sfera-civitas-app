@@ -22,11 +22,7 @@ import db
 import service as s
 
 app = FastAPI(title="Sfera Civitas — Desarrollo", version="0.1")
-# CORS: si la PWA se aloja en otro dominio que el backend, define
-# SFERA_CORS con los orígenes permitidos separados por comas (o "*" en pruebas).
 _origins = os.environ.get("SFERA_CORS", "*").split(",")
-app.add_middleware(CORSMiddleware, allow_origins=[o.strip() for o in _origins],
-                   allow_methods=["*"], allow_headers=["*"])
 
 # ── Rate limiting (anti-Sybil / anti-fuerza bruta) ────────────────────────────
 # Ventana deslizante en memoria por IP y endpoint sensible. Suficiente para el
@@ -55,6 +51,11 @@ async def rate_limit(request: Request, call_next):
         dq.append(now)
     return await call_next(request)
 
+
+# CORS se añade DESPUÉS del rate-limit para que sea el middleware MÁS EXTERNO:
+# así incluso las respuestas 429 llevan cabeceras CORS y el navegador puede leerlas.
+app.add_middleware(CORSMiddleware, allow_origins=[o.strip() for o in _origins],
+                   allow_methods=["*"], allow_headers=["*"])
 
 db.init_db()
 WEB_DIR = os.path.join(os.path.dirname(__file__), "..", "web")
