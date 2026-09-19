@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from contextlib import contextmanager
 
 PG_DSN = os.environ.get("SFERA_PG")
 PG_PW = os.environ.get("SFERA_DB_PASSWORD")  # contraseña por separado (evita codificar la URL)
@@ -34,10 +35,12 @@ if BACKEND == "sqlite":
     import sqlite3
     DB_PATH = os.environ.get("SFERA_DB", os.path.join(os.path.dirname(__file__), "sfera_dev.db"))
     _TYPES = {"AUTOINC": "INTEGER PRIMARY KEY AUTOINCREMENT", "REAL": "REAL"}
+    INTEGRITY_ERRORS = (sqlite3.IntegrityError,)
 else:  # postgres (driver importado solo aquí)
     import psycopg  # type: ignore
     from psycopg.rows import dict_row  # type: ignore
     _TYPES = {"AUTOINC": "BIGSERIAL PRIMARY KEY", "REAL": "DOUBLE PRECISION"}
+    INTEGRITY_ERRORS = (psycopg.errors.IntegrityError,)
 
 
 class _Cur:
@@ -101,6 +104,30 @@ def connect() -> Conn:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     return Conn(conn, "sqlite")
+
+
+@contextmanager
+def session():
+    """Conexión con cierre SIEMPRE garantizado (evita fugas en el pooler) y
+    rollback automático si hay excepción. El llamante hace commit() al terminar."""
+    conn = connect()
+    try:
+        yield conn
+    except Exception:
+        try:
+            conn._raw.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
+def lock_row(conn, table: str, row_id) -> None:
+    """Serializa operaciones concurrentes sobre una fila (SELECT ... FOR UPDATE en
+    Postgres). En SQLite las escrituras ya se serializan globalmente."""
+    if BACKEND == "postgres":
+        conn.execute(f"SELECT id FROM {table} WHERE id=? FOR UPDATE", (row_id,))
 
 
 SCHEMA = """
@@ -182,7 +209,8 @@ CREATE TABLE IF NOT EXISTS bulletin_board (
   payload_json TEXT NOT NULL,
   prev_hash TEXT NOT NULL,
   entry_hash TEXT NOT NULL,
-  created {REAL}
+  created {REAL},
+  UNIQUE (election_id, seq)             -- backstop anti-carrera del nº de secuencia
 );
 """.replace("{AUTOINC}", _TYPES["AUTOINC"]).replace("{REAL}", _TYPES["REAL"])
 
@@ -205,6 +233,11 @@ def init_db():
     if BACKEND == "postgres":
         conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin INTEGER DEFAULT 0")
         conn.commit()
+        try:  # unique del tablón en tablas preexistentes (idempotente)
+            conn.execute("ALTER TABLE bulletin_board ADD CONSTRAINT uq_bb_seq UNIQUE (election_id, seq)")
+            conn.commit()
+        except Exception:
+            conn._raw.rollback()
     else:
         cols = [r[1] for r in conn._raw.execute("PRAGMA table_info(users)").fetchall()]  # type: ignore[attr-defined]
         if "is_admin" not in cols:

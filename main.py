@@ -8,11 +8,14 @@ Arranque:
 """
 from __future__ import annotations
 import os
+import time
+from collections import defaultdict, deque
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 import db
@@ -24,6 +27,35 @@ app = FastAPI(title="Sfera Civitas — Desarrollo", version="0.1")
 _origins = os.environ.get("SFERA_CORS", "*").split(",")
 app.add_middleware(CORSMiddleware, allow_origins=[o.strip() for o in _origins],
                    allow_methods=["*"], allow_headers=["*"])
+
+# ── Rate limiting (anti-Sybil / anti-fuerza bruta) ────────────────────────────
+# Ventana deslizante en memoria por IP y endpoint sensible. Suficiente para el
+# piloto (1 instancia). Límites configurables por entorno.
+_HITS: dict = defaultdict(deque)
+_LIMITS = {  # (máx peticiones, ventana en segundos)
+    "/api/register": (int(os.environ.get("SFERA_RL_REGISTER", "5")), 3600),
+    "/api/login":    (int(os.environ.get("SFERA_RL_LOGIN", "20")), 900),
+    "/api/verify":   (int(os.environ.get("SFERA_RL_VERIFY", "20")), 900),
+}
+
+
+@app.middleware("http")
+async def rate_limit(request: Request, call_next):
+    limit = _LIMITS.get(request.url.path)
+    if limit and request.method == "POST":
+        ip = (request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+              or (request.client.host if request.client else "?"))
+        maxn, window = limit
+        now = time.time()
+        dq = _HITS[(ip, request.url.path)]
+        while dq and dq[0] < now - window:
+            dq.popleft()
+        if len(dq) >= maxn:
+            return JSONResponse({"detail": "Demasiadas solicitudes; inténtalo más tarde."}, status_code=429)
+        dq.append(now)
+    return await call_next(request)
+
+
 db.init_db()
 WEB_DIR = os.path.join(os.path.dirname(__file__), "..", "web")
 
@@ -60,6 +92,8 @@ class CertIn(BaseModel):
     email: str; cert_subject: str
 class LoginIn(BaseModel):
     email: str; password: str
+class ChangePwIn(BaseModel):
+    old_password: str; new_password: str
 class DebateIn(BaseModel):
     title: str; body: str = ""; materia: str = ""; administracion: str = ""
 class PhaseIn(BaseModel):
@@ -86,6 +120,9 @@ def verify(i: VerifyIn): return _wrap(s.verify, i.email, i.code)
 def verify_certificate(i: CertIn): return _wrap(s.verify_certificate, i.email, i.cert_subject)
 @app.post("/api/login")
 def login(i: LoginIn): return _wrap(s.login, i.email, i.password)
+@app.post("/api/change-password")
+def change_password(i: ChangePwIn, u=Depends(current_user)):
+    return _wrap(s.change_password, u["id"], i.old_password, i.new_password)
 
 
 # ── debates / fases ──────────────────────────────────────────────────────────
