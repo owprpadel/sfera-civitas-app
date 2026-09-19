@@ -36,9 +36,19 @@ def _wrap(fn, *a, **k):
 
 
 def current_user(authorization: Optional[str] = Header(None)) -> dict:
-    if not authorization or not authorization.startswith("Bearer user:"):
+    if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "No autenticado")
-    return _wrap(s.get_user, authorization.split("user:")[1])
+    uid = s.parse_token(authorization[len("Bearer "):].strip())
+    if uid is None:
+        raise HTTPException(401, "Sesión inválida o caducada")
+    return _wrap(s.get_user, uid)
+
+
+def admin_user(u=Depends(current_user)) -> dict:
+    """Rol de administrador: convocar asuntos y abrir/cerrar votaciones y fases."""
+    if not u.get("is_admin"):
+        raise HTTPException(403, "Requiere rol de administrador")
+    return u
 
 
 # ── modelos ──────────────────────────────────────────────────────────────────
@@ -80,14 +90,14 @@ def login(i: LoginIn): return _wrap(s.login, i.email, i.password)
 
 # ── debates / fases ──────────────────────────────────────────────────────────
 @app.post("/api/debates")
-def create_debate(i: DebateIn, u=Depends(current_user)):
+def create_debate(i: DebateIn, u=Depends(admin_user)):
     return _wrap(s.create_debate, i.title, i.body, i.materia, i.administracion)
 @app.get("/api/debates")
 def list_debates(): return s.list_debates()
 @app.get("/api/debates/{did}")
 def get_debate(did: int): return _wrap(s.get_debate, did)
 @app.post("/api/debates/{did}/phase")
-def set_phase(did: int, i: PhaseIn, u=Depends(current_user)): return _wrap(s.set_phase, did, i.phase)
+def set_phase(did: int, i: PhaseIn, u=Depends(admin_user)): return _wrap(s.set_phase, did, i.phase)
 @app.post("/api/debates/{did}/arguments")
 def add_argument(did: int, i: ArgIn, u=Depends(current_user)):
     return _wrap(s.add_argument, did, u["id"], i.stance, i.text)
@@ -98,7 +108,7 @@ def add_proposal(did: int, i: PropIn, u=Depends(current_user)):
 
 # ── voto ─────────────────────────────────────────────────────────────────────
 @app.post("/api/debates/{did}/election")
-def open_election(did: int, i: ElectionIn, u=Depends(current_user)):
+def open_election(did: int, i: ElectionIn, u=Depends(admin_user)):
     return _wrap(s.open_election, did, i.question, i.options)
 @app.get("/api/elections/{eid}")
 def election_public(eid: int): return _wrap(s.election_public, eid)
@@ -109,7 +119,7 @@ def issue_credential(eid: int, i: CredIn, u=Depends(current_user)):
 def cast_vote(eid: int, i: CastIn):
     return _wrap(s.cast_vote, eid, i.token_hex, i.sig, i.ballot, i.bit_proofs, i.sum_proof, i.via)
 @app.post("/api/elections/{eid}/close")
-def close_election(eid: int, u=Depends(current_user)): return _wrap(s.close_election, eid)
+def close_election(eid: int, u=Depends(admin_user)): return _wrap(s.close_election, eid)
 @app.get("/api/elections/{eid}/board")
 def get_board(eid: int): return s.get_board(eid)
 @app.get("/api/elections/{eid}/audit")

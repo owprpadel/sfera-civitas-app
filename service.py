@@ -13,9 +13,13 @@ Cada vía tiene su propia clave de firma ciega y su propio recuento homomórfico
 los resultados se publican por separado con su etiqueta de garantía.
 """
 from __future__ import annotations
+import base64
 import hashlib
+import hmac
 import json
+import os
 import secrets
+import time
 from time import gmtime, strftime
 
 import db
@@ -25,6 +29,14 @@ import crypto_zk as zk
 PHASES = ["convocar", "deliberar", "proponer", "votar", "publicar"]
 VIAS = ("open", "verified")
 UMBRAL = {"open": 100, "verified": 25}  # apoyos de convocatoria por vía (doctrina §3.2)
+
+# ── Sesiones firmadas (mejora de seguridad) ──────────────────────────────────
+# El token ya NO es "user:<id>" (falsificable): es id+caducidad firmados con HMAC
+# usando el secreto del servidor (SFERA_SECRET). Sin el secreto no se puede forjar.
+_SECRET = (os.environ.get("SFERA_SECRET") or "DEV-INSECURE-SECRET-cambiar-en-produccion").encode()
+TOKEN_TTL = 7 * 24 * 3600  # 7 días
+# Emails con rol de administrador (convocar/abrir/cerrar votaciones), separados por comas.
+ADMIN_EMAILS = {e.strip().lower() for e in os.environ.get("SFERA_ADMIN_EMAILS", "").split(",") if e.strip()}
 
 
 class SferaError(Exception):
@@ -36,6 +48,28 @@ class SferaError(Exception):
 
 def _hash_pw(pw: str) -> str:
     return hashlib.sha256(("sfera$" + pw).encode()).hexdigest()
+
+
+def make_token(uid: int) -> str:
+    """Token de sesión firmado: base64(id.exp.hmac). Inforjable sin SFERA_SECRET."""
+    payload = f"{uid}.{int(time.time()) + TOKEN_TTL}"
+    mac = hmac.new(_SECRET, payload.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}.{mac}".encode()).decode()
+
+
+def parse_token(token: str):
+    """Devuelve el user_id si la firma es válida y no ha caducado; si no, None."""
+    try:
+        raw = base64.urlsafe_b64decode(token.encode()).decode()
+        uid, exp, mac = raw.split(".")
+        good = hmac.new(_SECRET, f"{uid}.{exp}".encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(mac, good):
+            return None
+        if int(exp) < time.time():
+            return None
+        return int(uid)
+    except Exception:
+        return None
 
 
 def get_user(uid) -> dict:
@@ -55,9 +89,10 @@ def register(email: str, password: str) -> dict:
         conn.close()
         raise SferaError(400, "Email ya registrado")
     code = f"{secrets.randbelow(1000000):06d}"
+    adm = 1 if email.lower() in ADMIN_EMAILS else 0
     cur = conn.execute(
-        "INSERT INTO users(email,pass_hash,verified,loa,twofa_code,created) VALUES(?,?,0,'open',?,?)",
-        (email, _hash_pw(password), code, db.now()), returning=True)
+        "INSERT INTO users(email,pass_hash,verified,loa,is_admin,twofa_code,created) VALUES(?,?,0,'open',?,?,?)",
+        (email, _hash_pw(password), adm, code, db.now()), returning=True)
     conn.commit()
     uid = cur.lastrowid
     conn.close()
@@ -106,11 +141,20 @@ def verify_certificate(email: str, cert_subject: str) -> dict:
 def login(email: str, password: str) -> dict:
     conn = db.connect()
     row = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
-    conn.close()
     if not row or row["pass_hash"] != _hash_pw(password):
+        conn.close()
         raise SferaError(401, "Credenciales inválidas")
-    return {"token": f"user:{row['id']}", "user_id": row["id"],
-            "verified": bool(row["verified"]), "loa": row["loa"], "email": email}
+    d = dict(row)
+    is_admin = bool(d.get("is_admin"))
+    # Promoción idempotente: si el email está en SFERA_ADMIN_EMAILS, asegura el rol.
+    if email.lower() in ADMIN_EMAILS and not is_admin:
+        conn.execute("UPDATE users SET is_admin=1 WHERE id=?", (row["id"],))
+        conn.commit()
+        is_admin = True
+    conn.close()
+    return {"token": make_token(row["id"]), "user_id": row["id"],
+            "verified": bool(row["verified"]), "loa": row["loa"],
+            "is_admin": is_admin, "email": email}
 
 
 # ── Debates / fases ──────────────────────────────────────────────────────────
