@@ -193,7 +193,12 @@ def init_db():
         # executescript no existe en la capa; usa el raw
         conn._raw.executescript(SCHEMA)  # type: ignore[attr-defined]
     else:
-        for stmt in [s for s in SCHEMA.split(";") if s.strip()]:
+        # Postgres no acepta varias sentencias por execute; se dividen por ';'.
+        # Antes hay que retirar los comentarios de línea (--...), porque alguno
+        # contiene ';' y rompería la división (SyntaxError). SQLite usa executescript.
+        import re
+        sql_pg = re.sub(r"--[^\n]*", "", SCHEMA)
+        for stmt in [s for s in sql_pg.split(";") if s.strip()]:
             conn.execute(stmt + ";")
     conn.commit()
     # Migración idempotente: garantiza la columna is_admin en tablas 'users' preexistentes.
