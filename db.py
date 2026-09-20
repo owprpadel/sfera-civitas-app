@@ -214,6 +214,19 @@ CREATE TABLE IF NOT EXISTS bulletin_board (
   UNIQUE (election_id, seq)             -- backstop anti-carrera del nº de secuencia
 );
 
+-- CAPA GOBERNANZA (roles por ámbito) -----------------------------------------
+-- Super Admin = users.is_admin (global). Delegados via 'grants' por ámbito.
+CREATE TABLE IF NOT EXISTS grants (
+  id {AUTOINC},
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  role TEXT NOT NULL,                    -- 'admin' | 'expert'
+  scope_type TEXT NOT NULL,             -- 'global' | 'aapp' | 'materia' | 'debate'
+  scope_value TEXT NOT NULL DEFAULT '', -- valor (AAPP/materia/id de asunto); '' = global
+  granted_by INTEGER,
+  created {REAL},
+  UNIQUE (user_id, role, scope_type, scope_value)
+);
+
 -- CAPA REPOSITORIO DOCUMENTAL (biblioteca por asunto) -------------------------
 -- Lectura PÚBLICA. Escritura por capas: oficiales = expertos asignados; enmiendas
 -- = verificados; comentarios/fuentes = registrados. Todo versionado y atribuido.

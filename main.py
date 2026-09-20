@@ -21,6 +21,7 @@ from pydantic import BaseModel
 import db
 import service as s
 import docs_service as ds
+import roles as rl
 
 app = FastAPI(title="Sfera Civitas — Desarrollo", version="0.1")
 _origins = os.environ.get("SFERA_CORS", "*").split(",")
@@ -112,7 +113,12 @@ class CastIn(BaseModel):
     token_hex: str; sig: str; ballot: list[dict]
     bit_proofs: list[dict]; sum_proof: dict; via: str = "open"
 class ExpertIn(BaseModel):
-    user_id: int
+    user_id: Optional[int] = None
+    email: Optional[str] = None
+class GrantIn(BaseModel):
+    email: str; role: str; scope_type: str; scope_value: str = ""
+class GrantRevokeIn(BaseModel):
+    grant_id: int
 class DocIn(BaseModel):
     doc_type: str; title: str; content_kind: str = "text"
     content_text: Optional[str] = None
@@ -141,14 +147,14 @@ def change_password(i: ChangePwIn, u=Depends(current_user)):
 
 # ── debates / fases ──────────────────────────────────────────────────────────
 @app.post("/api/debates")
-def create_debate(i: DebateIn, u=Depends(admin_user)):
-    return _wrap(s.create_debate, i.title, i.body, i.materia, i.administracion)
+def create_debate(i: DebateIn, u=Depends(current_user)):
+    return _wrap(s.create_debate, i.title, i.body, i.materia, i.administracion, u)
 @app.get("/api/debates")
 def list_debates(): return s.list_debates()
 @app.get("/api/debates/{did}")
 def get_debate(did: int): return _wrap(s.get_debate, did)
 @app.post("/api/debates/{did}/phase")
-def set_phase(did: int, i: PhaseIn, u=Depends(admin_user)): return _wrap(s.set_phase, did, i.phase)
+def set_phase(did: int, i: PhaseIn, u=Depends(current_user)): return _wrap(s.set_phase, did, i.phase, u)
 @app.post("/api/debates/{did}/arguments")
 def add_argument(did: int, i: ArgIn, u=Depends(current_user)):
     return _wrap(s.add_argument, did, u["id"], i.stance, i.text)
@@ -159,8 +165,8 @@ def add_proposal(did: int, i: PropIn, u=Depends(current_user)):
 
 # ── voto ─────────────────────────────────────────────────────────────────────
 @app.post("/api/debates/{did}/election")
-def open_election(did: int, i: ElectionIn, u=Depends(admin_user)):
-    return _wrap(s.open_election, did, i.question, i.options)
+def open_election(did: int, i: ElectionIn, u=Depends(current_user)):
+    return _wrap(s.open_election, did, i.question, i.options, u)
 @app.get("/api/elections/{eid}")
 def election_public(eid: int): return _wrap(s.election_public, eid)
 @app.post("/api/elections/{eid}/credential")
@@ -170,7 +176,7 @@ def issue_credential(eid: int, i: CredIn, u=Depends(current_user)):
 def cast_vote(eid: int, i: CastIn):
     return _wrap(s.cast_vote, eid, i.token_hex, i.sig, i.ballot, i.bit_proofs, i.sum_proof, i.via)
 @app.post("/api/elections/{eid}/close")
-def close_election(eid: int, u=Depends(admin_user)): return _wrap(s.close_election, eid)
+def close_election(eid: int, u=Depends(current_user)): return _wrap(s.close_election, eid, u)
 @app.get("/api/elections/{eid}/board")
 def get_board(eid: int): return s.get_board(eid)
 @app.get("/api/elections/{eid}/audit")
@@ -179,10 +185,21 @@ def audit(eid: int): return _wrap(s.audit, eid)
 
 # ── repositorio documental (biblioteca por asunto) ────────────────────────────
 @app.post("/api/debates/{did}/experts")
-def assign_expert(did: int, i: ExpertIn, u=Depends(admin_user)):
-    return _wrap(ds.assign_expert, did, i.user_id)
+def assign_expert(did: int, i: ExpertIn, u=Depends(current_user)):
+    return _wrap(ds.assign_expert, did, (i.email if i.email else i.user_id), u)
 @app.get("/api/debates/{did}/experts")
 def list_experts(did: int): return ds.list_experts(did)
+@app.get("/api/debates/{did}/myrole")
+def my_role(did: int, u=Depends(current_user)): return _wrap(rl.my_role, u, did)
+
+# ── gobernanza: roles por ámbito (Super Admin) ────────────────────────────────
+@app.post("/api/grants")
+def create_grant(i: GrantIn, u=Depends(current_user)):
+    return _wrap(rl.grant_role, u, i.email, i.role, i.scope_type, i.scope_value)
+@app.get("/api/grants")
+def list_grants(u=Depends(current_user)): return _wrap(rl.list_grants, u)
+@app.post("/api/grants/revoke")
+def revoke_grant(i: GrantRevokeIn, u=Depends(current_user)): return _wrap(rl.revoke_grant, u, i.grant_id)
 
 @app.get("/api/debates/{did}/documents")                 # LECTURA pública
 def list_documents(did: int): return ds.list_documents(did)

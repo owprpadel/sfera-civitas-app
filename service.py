@@ -229,8 +229,11 @@ def change_password(uid, old_password: str, new_password: str) -> dict:
 
 
 # ── Debates / fases ──────────────────────────────────────────────────────────
-def create_debate(title, body, materia, administracion) -> dict:
+def create_debate(title, body, materia, administracion, user) -> dict:
+    import roles
     with db.session() as conn:
+        if not roles.can_admin_new(conn, user, administracion, materia):
+            raise SferaError(403, "No tienes permiso para convocar asuntos en ese ámbito (AAPP/materia)")
         cur = conn.execute("INSERT INTO debates(title,body,materia,administracion,phase,created) VALUES(?,?,?,?,'deliberar',?)",
                            (title, body, materia, administracion, db.now()), returning=True)
         conn.commit()
@@ -259,10 +262,16 @@ def get_debate(did: int) -> dict:
     return out
 
 
-def set_phase(did: int, phase: str) -> dict:
+def set_phase(did: int, phase: str, user) -> dict:
+    import roles
     if phase not in PHASES:
         raise SferaError(400, "Fase inválida")
     with db.session() as conn:
+        d = conn.execute("SELECT * FROM debates WHERE id=?", (did,)).fetchone()
+        if not d:
+            raise SferaError(404, "No existe")
+        if not roles.can_admin(conn, user, d):
+            raise SferaError(403, "No tienes permiso de administración en este asunto")
         conn.execute("UPDATE debates SET phase=? WHERE id=?", (phase, did))
         conn.commit()
     return {"phase": phase}
@@ -284,9 +293,16 @@ def add_proposal(did, uid, text) -> dict:
 
 
 # ── Voto ─────────────────────────────────────────────────────────────────────
-def open_election(did, question, options, n_trustees: int = 3) -> dict:
+def open_election(did, question, options, user, n_trustees: int = 3) -> dict:
+    import roles
     if len(options) < 2:
         raise SferaError(400, "Mínimo 2 opciones")
+    with db.session() as conn:
+        d = conn.execute("SELECT * FROM debates WHERE id=?", (did,)).fetchone()
+        if not d:
+            raise SferaError(404, "Asunto no existe")
+        if not roles.can_admin(conn, user, d):
+            raise SferaError(403, "No tienes permiso de administración en este asunto")
     # Custodios DISTRIBUIDOS: clave pública combinada H = Π g^{x_i} (nadie descifra solo)
     shares, H = zk.gen_trustees(n_trustees)
     epub = cc.ElgamalPub(cc.P, cc.G, H)
@@ -432,12 +448,16 @@ def _tally_via(options, ballots_via, shares, n):
     return totals
 
 
-def close_election(eid) -> dict:
+def close_election(eid, user) -> dict:
+    import roles
     with db.session() as conn:
         db.lock_row(conn, "elections", eid)
         e = conn.execute("SELECT * FROM elections WHERE id=?", (eid,)).fetchone()
         if not e:
             raise SferaError(404, "No existe")
+        d = conn.execute("SELECT * FROM debates WHERE id=?", (e["debate_id"],)).fetchone()
+        if not roles.can_admin(conn, user, d):
+            raise SferaError(403, "No tienes permiso de administración en este asunto")
         options = json.loads(e["options_json"])
         rows = conn.execute("SELECT via,payload_json FROM bulletin_board WHERE election_id=? AND kind='ballot' ORDER BY seq", (eid,)).fetchall()
         shares = [zk.TrusteeShare(x=int(xs), h=pow(cc.G, int(xs), cc.P)) for xs in json.loads(_dec(e["trustees_json"]))]

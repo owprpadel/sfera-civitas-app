@@ -19,6 +19,7 @@ import hashlib
 import json
 
 import db
+import roles
 from service import SferaError
 
 DOC_TYPES = {"informe", "dictamen", "datos", "borrador", "anexo", "acta"}
@@ -27,13 +28,20 @@ MAX_FILE_BYTES = 2 * 1024 * 1024  # 2 MB por versión en v1 (BBDD)
 
 
 # ── Expertos ──────────────────────────────────────────────────────────────────
-def assign_expert(did: int, user_id: int) -> dict:
-    """ADMIN: asigna un experto a un asunto (y marca el flag global is_expert)."""
+def assign_expert(did: int, email_or_id, actor: dict) -> dict:
+    """Asigna un experto a un asunto. Permitido al Super Admin o al admin de ese ámbito.
+    Acepta email o id de usuario. Marca el flag global is_expert."""
     with db.session() as conn:
-        if not conn.execute("SELECT 1 FROM debates WHERE id=?", (did,)).fetchone():
+        d = conn.execute("SELECT * FROM debates WHERE id=?", (did,)).fetchone()
+        if not d:
             raise SferaError(404, "Asunto no existe")
-        if not conn.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone():
-            raise SferaError(404, "Usuario no existe")
+        if not roles.can_admin(conn, actor, d):
+            raise SferaError(403, "Solo el admin de este ámbito (o el Super Admin) puede asignar expertos")
+        row = conn.execute("SELECT id FROM users WHERE email=?", (str(email_or_id),)).fetchone() \
+            if not str(email_or_id).isdigit() else conn.execute("SELECT id FROM users WHERE id=?", (int(email_or_id),)).fetchone()
+        if not row:
+            raise SferaError(404, "No existe ese usuario (debe registrarse primero)")
+        user_id = row["id"]
         try:
             conn.execute("INSERT INTO debate_experts(debate_id,user_id,assigned_at) VALUES(?,?,?)",
                          (did, user_id, db.now()))
@@ -106,10 +114,11 @@ def create_document(did, user, doc_type, title, content_kind, content_text=None,
     _validate_content(content_kind, content_text, data_b64, file_name)
     with db.session() as conn:
         db.lock_row(conn, "debates", did)
-        if not conn.execute("SELECT 1 FROM debates WHERE id=?", (did,)).fetchone():
+        d = conn.execute("SELECT * FROM debates WHERE id=?", (did,)).fetchone()
+        if not d:
             raise SferaError(404, "Asunto no existe")
-        if not _is_assigned_expert(conn, did, user):
-            raise SferaError(403, "Solo un experto asignado a este asunto (o admin) puede crear documentos oficiales")
+        if not roles.can_author(conn, user, d):
+            raise SferaError(403, "Solo un experto de este ámbito (o admin) puede crear documentos oficiales")
         sha = _content_sha(content_kind, content_text, data_b64)
         cur = conn.execute("INSERT INTO documents(debate_id,doc_type,title,status,created_by,created) VALUES(?,?,?,?,?,?)",
                            (did, doc_type, title, status, user["id"], db.now()), returning=True)
@@ -131,8 +140,9 @@ def add_version(document_id, user, content_kind, content_text=None,
             raise SferaError(404, "Documento no existe")
         did = doc["debate_id"]
         db.lock_row(conn, "debates", did)
-        if not _is_assigned_expert(conn, did, user):
-            raise SferaError(403, "Solo un experto asignado (o admin) puede publicar nuevas versiones")
+        d = conn.execute("SELECT * FROM debates WHERE id=?", (did,)).fetchone()
+        if not roles.can_author(conn, user, d):
+            raise SferaError(403, "Solo un experto de este ámbito (o admin) puede publicar nuevas versiones")
         last = conn.execute("SELECT MAX(version_no) AS m FROM document_versions WHERE document_id=?",
                             (document_id,)).fetchone()
         vno = (last["m"] or 0) + 1
