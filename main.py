@@ -20,6 +20,7 @@ from pydantic import BaseModel
 
 import db
 import service as s
+import docs_service as ds
 
 app = FastAPI(title="Sfera Civitas — Desarrollo", version="0.1")
 _origins = os.environ.get("SFERA_CORS", "*").split(",")
@@ -110,6 +111,18 @@ class CredIn(BaseModel):
 class CastIn(BaseModel):
     token_hex: str; sig: str; ballot: list[dict]
     bit_proofs: list[dict]; sum_proof: dict; via: str = "open"
+class ExpertIn(BaseModel):
+    user_id: int
+class DocIn(BaseModel):
+    doc_type: str; title: str; content_kind: str = "text"
+    content_text: Optional[str] = None
+    file_name: Optional[str] = None; mime_type: Optional[str] = None; data_b64: Optional[str] = None
+class VersionIn(BaseModel):
+    content_kind: str = "text"
+    content_text: Optional[str] = None
+    file_name: Optional[str] = None; mime_type: Optional[str] = None; data_b64: Optional[str] = None
+class ContribIn(BaseModel):
+    kind: str; text: str; url: Optional[str] = None
 
 
 # ── identidad ────────────────────────────────────────────────────────────────
@@ -162,6 +175,35 @@ def close_election(eid: int, u=Depends(admin_user)): return _wrap(s.close_electi
 def get_board(eid: int): return s.get_board(eid)
 @app.get("/api/elections/{eid}/audit")
 def audit(eid: int): return _wrap(s.audit, eid)
+
+
+# ── repositorio documental (biblioteca por asunto) ────────────────────────────
+@app.post("/api/debates/{did}/experts")
+def assign_expert(did: int, i: ExpertIn, u=Depends(admin_user)):
+    return _wrap(ds.assign_expert, did, i.user_id)
+@app.get("/api/debates/{did}/experts")
+def list_experts(did: int): return ds.list_experts(did)
+
+@app.get("/api/debates/{did}/documents")                 # LECTURA pública
+def list_documents(did: int): return ds.list_documents(did)
+@app.post("/api/debates/{did}/documents")                # crear oficial: experto/admin
+def create_document(did: int, i: DocIn, u=Depends(current_user)):
+    return _wrap(ds.create_document, did, u, i.doc_type, i.title, i.content_kind,
+                 i.content_text, i.file_name, i.mime_type, i.data_b64)
+@app.get("/api/documents/{doc_id}")                      # LECTURA pública
+def get_document(doc_id: int): return _wrap(ds.get_document, doc_id)
+@app.get("/api/documents/{doc_id}/versions/{n}")         # contenido público
+def get_version_content(doc_id: int, n: int): return _wrap(ds.get_version_content, doc_id, n)
+@app.post("/api/documents/{doc_id}/versions")            # nueva versión: experto/admin
+def add_version(doc_id: int, i: VersionIn, u=Depends(current_user)):
+    return _wrap(ds.add_version, doc_id, u, i.content_kind, i.content_text, i.file_name, i.mime_type, i.data_b64)
+@app.post("/api/documents/{doc_id}/contributions")       # comentario/fuente/enmienda
+def add_contribution(doc_id: int, i: ContribIn, u=Depends(current_user)):
+    return _wrap(ds.add_contribution, doc_id, u, i.kind, i.text, i.url)
+@app.get("/api/debates/{did}/doc-ledger")                # ledger público
+def doc_ledger(did: int): return ds.get_ledger(did)
+@app.get("/api/debates/{did}/doc-audit")                 # auditoría pública del ledger
+def doc_audit(did: int): return ds.audit_ledger(did)
 
 
 # ── frontend (PWA) ───────────────────────────────────────────────────────────

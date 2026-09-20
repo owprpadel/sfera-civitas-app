@@ -139,6 +139,7 @@ CREATE TABLE IF NOT EXISTS users (
   verified INTEGER DEFAULT 0,           -- 2FA de email completado (vía abierta)
   loa TEXT DEFAULT 'open',              -- nivel de garantía: 'open' (tipo X) | 'verified' (certificado)
   is_admin INTEGER DEFAULT 0,           -- rol de administrador (convocar/abrir/cerrar votaciones)
+  is_expert INTEGER DEFAULT 0,          -- rol de experto (autoría de documentos oficiales)
   cert_subject TEXT,                    -- identificador del certificado (DEV: simulado)
   twofa_code TEXT,
   created {REAL}
@@ -212,6 +213,60 @@ CREATE TABLE IF NOT EXISTS bulletin_board (
   created {REAL},
   UNIQUE (election_id, seq)             -- backstop anti-carrera del nº de secuencia
 );
+
+-- CAPA REPOSITORIO DOCUMENTAL (biblioteca por asunto) -------------------------
+-- Lectura PÚBLICA. Escritura por capas: oficiales = expertos asignados; enmiendas
+-- = verificados; comentarios/fuentes = registrados. Todo versionado y atribuido.
+CREATE TABLE IF NOT EXISTS debate_experts (        -- expertos asignados a un asunto
+  debate_id INTEGER NOT NULL REFERENCES debates(id),
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  assigned_at {REAL},
+  PRIMARY KEY (debate_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS documents (
+  id {AUTOINC},
+  debate_id INTEGER NOT NULL REFERENCES debates(id),
+  doc_type TEXT NOT NULL,                -- informe|dictamen|datos|borrador|anexo|acta
+  title TEXT NOT NULL,
+  status TEXT DEFAULT 'publicado',       -- borrador|publicado
+  created_by INTEGER NOT NULL REFERENCES users(id),
+  created {REAL}
+);
+CREATE TABLE IF NOT EXISTS document_versions (
+  id {AUTOINC},
+  document_id INTEGER NOT NULL REFERENCES documents(id),
+  version_no INTEGER NOT NULL,
+  content_kind TEXT NOT NULL,            -- 'text' | 'file'
+  content_text TEXT,                     -- si es texto (markdown/plano)
+  file_name TEXT, mime_type TEXT, data_b64 TEXT,   -- si es fichero (base64)
+  sha256 TEXT NOT NULL,                  -- hash del contenido (anclado al ledger)
+  created_by INTEGER NOT NULL REFERENCES users(id),
+  created {REAL},
+  UNIQUE (document_id, version_no)
+);
+CREATE TABLE IF NOT EXISTS document_contributions (
+  id {AUTOINC},
+  document_id INTEGER NOT NULL REFERENCES documents(id),
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  kind TEXT NOT NULL,                    -- comentario|fuente|enmienda
+  text TEXT NOT NULL,
+  url TEXT,
+  created {REAL}
+);
+-- Cadena de hashes POR ASUNTO para los documentos (integridad a prueba de manipulación)
+CREATE TABLE IF NOT EXISTS document_ledger (
+  id {AUTOINC},
+  debate_id INTEGER NOT NULL REFERENCES debates(id),
+  seq INTEGER NOT NULL,
+  document_id INTEGER NOT NULL,
+  version INTEGER NOT NULL,
+  sha256 TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  prev_hash TEXT NOT NULL,
+  entry_hash TEXT NOT NULL,
+  created {REAL},
+  UNIQUE (debate_id, seq)
+);
 """.replace("{AUTOINC}", _TYPES["AUTOINC"]).replace("{REAL}", _TYPES["REAL"])
 
 
@@ -232,6 +287,7 @@ def init_db():
     # Migración idempotente: garantiza la columna is_admin en tablas 'users' preexistentes.
     if BACKEND == "postgres":
         conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin INTEGER DEFAULT 0")
+        conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_expert INTEGER DEFAULT 0")
         conn.commit()
         try:  # unique del tablón en tablas preexistentes (idempotente)
             conn.execute("ALTER TABLE bulletin_board ADD CONSTRAINT uq_bb_seq UNIQUE (election_id, seq)")
@@ -242,6 +298,9 @@ def init_db():
         cols = [r[1] for r in conn._raw.execute("PRAGMA table_info(users)").fetchall()]  # type: ignore[attr-defined]
         if "is_admin" not in cols:
             conn._raw.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")  # type: ignore[attr-defined]
+            conn.commit()
+        if "is_expert" not in cols:
+            conn._raw.execute("ALTER TABLE users ADD COLUMN is_expert INTEGER DEFAULT 0")  # type: ignore[attr-defined]
             conn.commit()
     conn.close()
 
