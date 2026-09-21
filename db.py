@@ -163,7 +163,10 @@ CREATE TABLE IF NOT EXISTS debates (
   body TEXT,
   materia TEXT,
   administracion TEXT,
+  nivel TEXT,                           -- estado | ccaa | provincia | municipio
+  territorio TEXT,                      -- nombre concreto (p.ej. "Madrid", "Cataluña", "España")
   phase TEXT DEFAULT 'convocar',
+  cierre {REAL},                        -- fecha límite de la votación (epoch); NULL si no está en votación
   hidden INTEGER DEFAULT 0,             -- 1 = archivado (no se lista): p.ej. datos de prueba
   created {REAL}
 );
@@ -318,6 +321,9 @@ def init_db():
         conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS cert_pid TEXT")
         conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS cert_verified_at DOUBLE PRECISION")
         conn.execute("ALTER TABLE debates ADD COLUMN IF NOT EXISTS hidden INTEGER DEFAULT 0")
+        conn.execute("ALTER TABLE debates ADD COLUMN IF NOT EXISTS nivel TEXT")
+        conn.execute("ALTER TABLE debates ADD COLUMN IF NOT EXISTS territorio TEXT")
+        conn.execute("ALTER TABLE debates ADD COLUMN IF NOT EXISTS cierre DOUBLE PRECISION")
         conn.commit()
         try:  # unique del tablón en tablas preexistentes (idempotente)
             conn.execute("ALTER TABLE bulletin_board ADD CONSTRAINT uq_bb_seq UNIQUE (election_id, seq)")
@@ -342,6 +348,15 @@ def init_db():
         if "hidden" not in dcols:
             conn._raw.execute("ALTER TABLE debates ADD COLUMN hidden INTEGER DEFAULT 0")  # type: ignore[attr-defined]
             conn.commit()
+        if "nivel" not in dcols:
+            conn._raw.execute("ALTER TABLE debates ADD COLUMN nivel TEXT")  # type: ignore[attr-defined]
+            conn.commit()
+        if "territorio" not in dcols:
+            conn._raw.execute("ALTER TABLE debates ADD COLUMN territorio TEXT")  # type: ignore[attr-defined]
+            conn.commit()
+        if "cierre" not in dcols:
+            conn._raw.execute("ALTER TABLE debates ADD COLUMN cierre REAL")  # type: ignore[attr-defined]
+            conn.commit()
     seed_and_clean(conn)
     conn.close()
 
@@ -353,13 +368,13 @@ _TEST_TITLE_PREFIXES = ("Prueba E2E", "Voto real", "Sec E2E", "Asunto admin", "T
 _SEED_DEBATES = [
     ("Ampliar el horario de las bibliotecas públicas en época de exámenes",
      "¿Deberían las bibliotecas municipales ampliar su horario (noches y fines de semana) durante los periodos de exámenes? Coste, seguridad y demanda real sobre la mesa.",
-     "Cultura y Educación", "Ayuntamiento"),
+     "Cultura y Educación", "Ayuntamiento", "municipio", "Madrid"),
     ("Regulación de los patinetes eléctricos en el casco urbano",
      "¿Cómo ordenar la circulación y el aparcamiento de patinetes eléctricos: velocidad, zonas permitidas y estacionamiento? Buscamos convivencia entre peatones, ciclistas y usuarios.",
-     "Movilidad", "Ayuntamiento"),
+     "Movilidad", "Ayuntamiento", "municipio", "Valencia"),
     ("Uso de un solar público en desuso del barrio",
      "Un solar municipal lleva años vacío. ¿Qué le damos: zona verde, aparcamiento, huerto urbano, espacio deportivo o pistas polivalentes? Decidimos con datos de coste y mantenimiento.",
-     "Urbanismo", "Ayuntamiento"),
+     "Urbanismo", "Ayuntamiento", "municipio", "Sevilla"),
 ]
 
 
@@ -370,13 +385,16 @@ def seed_and_clean(conn):
         # 1) Archivar datos de prueba (hidden=1). No se eliminan (auditabilidad).
         for pref in _TEST_TITLE_PREFIXES:
             conn.execute("UPDATE debates SET hidden=1 WHERE title LIKE ?", (pref + "%",))
-        # 2) Sembrar ejemplos si no están ya (por título).
-        for title, body, materia, admin in _SEED_DEBATES:
+        # 2) Sembrar ejemplos si no están ya (por título). Si existen, completa nivel/territorio.
+        for title, body, materia, admin, nivel, terr in _SEED_DEBATES:
             ex = conn.execute("SELECT id FROM debates WHERE title=?", (title,)).fetchone()
             if not ex:
                 conn.execute(
-                    "INSERT INTO debates(title,body,materia,administracion,phase,hidden,created) "
-                    "VALUES(?,?,?,?,'deliberar',0,?)", (title, body, materia, admin, now()))
+                    "INSERT INTO debates(title,body,materia,administracion,nivel,territorio,phase,hidden,created) "
+                    "VALUES(?,?,?,?,?,?,'deliberar',0,?)", (title, body, materia, admin, nivel, terr, now()))
+            else:
+                conn.execute("UPDATE debates SET nivel=COALESCE(nivel,?), territorio=COALESCE(territorio,?) WHERE title=?",
+                             (nivel, terr, title))
         conn.commit()
     except Exception:
         try: conn._raw.rollback()

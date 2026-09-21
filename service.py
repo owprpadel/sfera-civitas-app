@@ -35,6 +35,7 @@ import crypto_core as cc
 import crypto_zk as zk
 
 PHASES = ["convocar", "deliberar", "proponer", "votar", "publicar"]
+VOTACION_DIAS = 14  # ventana estándar de una votación (días) para fijar la fecha de cierre
 VIAS = ("open", "verified")
 UMBRAL = {"open": 100, "verified": 25}
 
@@ -229,13 +230,15 @@ def change_password(uid, old_password: str, new_password: str) -> dict:
 
 
 # ── Debates / fases ──────────────────────────────────────────────────────────
-def create_debate(title, body, materia, administracion, user) -> dict:
+def create_debate(title, body, materia, administracion, user, nivel="", territorio="") -> dict:
     import roles
     with db.session() as conn:
         if not roles.can_admin_new(conn, user, administracion, materia):
             raise SferaError(403, "No tienes permiso para convocar asuntos en ese ámbito (AAPP/materia)")
-        cur = conn.execute("INSERT INTO debates(title,body,materia,administracion,phase,created) VALUES(?,?,?,?,'deliberar',?)",
-                           (title, body, materia, administracion, db.now()), returning=True)
+        cur = conn.execute(
+            "INSERT INTO debates(title,body,materia,administracion,nivel,territorio,phase,created) "
+            "VALUES(?,?,?,?,?,?,'deliberar',?)",
+            (title, body, materia, administracion, (nivel or None), (territorio or None), db.now()), returning=True)
         conn.commit()
         did = cur.lastrowid
     return {"debate_id": did, "phase": "deliberar"}
@@ -243,9 +246,13 @@ def create_debate(title, body, materia, administracion, user) -> dict:
 
 def list_debates() -> list:
     # No se listan los asuntos archivados (hidden=1): p.ej. datos de prueba.
+    # Se añade 'aportaciones' = nº de argumentos + propuestas (participación real en deliberación).
     with db.session() as conn:
         rows = [dict(r) for r in conn.execute(
-            "SELECT * FROM debates WHERE COALESCE(hidden,0)=0 ORDER BY id DESC").fetchall()]
+            "SELECT d.*, "
+            "(SELECT COUNT(*) FROM arguments a WHERE a.debate_id=d.id) + "
+            "(SELECT COUNT(*) FROM proposals p WHERE p.debate_id=d.id) AS aportaciones "
+            "FROM debates d WHERE COALESCE(d.hidden,0)=0 ORDER BY d.id DESC").fetchall()]
     return rows
 
 
@@ -274,7 +281,12 @@ def set_phase(did: int, phase: str, user) -> dict:
             raise SferaError(404, "No existe")
         if not roles.can_admin(conn, user, d):
             raise SferaError(403, "No tienes permiso de administración en este asunto")
-        conn.execute("UPDATE debates SET phase=? WHERE id=?", (phase, did))
+        if phase == "votar":
+            # Al abrir votación se fija una fecha de cierre (ventana estándar de 14 días).
+            conn.execute("UPDATE debates SET phase=?, cierre=? WHERE id=?",
+                         (phase, db.now() + VOTACION_DIAS * 86400, did))
+        else:
+            conn.execute("UPDATE debates SET phase=? WHERE id=?", (phase, did))
         conn.commit()
     return {"phase": phase}
 
@@ -328,7 +340,8 @@ def open_election(did, question, options, user, n_trustees: int = 3) -> dict:
         entry_hash = cc.chain_hash("GENESIS", payload)
         conn.execute("INSERT INTO bulletin_board(election_id,seq,kind,via,payload_json,prev_hash,entry_hash,created) VALUES(?,?,?,?,?,?,?,?)",
                      (eid, 0, "genesis", None, payload, "GENESIS", entry_hash, db.now()))
-        conn.execute("UPDATE debates SET phase='votar' WHERE id=?", (did,))
+        conn.execute("UPDATE debates SET phase='votar', cierre=? WHERE id=?",
+                     (db.now() + VOTACION_DIAS * 86400, did))
         conn.commit()
     return {"election_id": eid}
 

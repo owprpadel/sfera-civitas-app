@@ -107,6 +107,7 @@ class ChangePwIn(BaseModel):
     old_password: str; new_password: str
 class DebateIn(BaseModel):
     title: str; body: str = ""; materia: str = ""; administracion: str = ""
+    nivel: str = ""; territorio: str = ""
 class PhaseIn(BaseModel):
     phase: str
 class ArgIn(BaseModel):
@@ -171,7 +172,7 @@ def change_password(i: ChangePwIn, u=Depends(current_user)):
 # ── debates / fases ──────────────────────────────────────────────────────────
 @app.post("/api/debates")
 def create_debate(i: DebateIn, u=Depends(current_user)):
-    return _wrap(s.create_debate, i.title, i.body, i.materia, i.administracion, u)
+    return _wrap(s.create_debate, i.title, i.body, i.materia, i.administracion, u, i.nivel, i.territorio)
 @app.get("/api/debates")
 def list_debates(): return s.list_debates()
 @app.get("/api/debates/{did}")
