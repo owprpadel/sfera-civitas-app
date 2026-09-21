@@ -2,3 +2,6 @@ fastapi>=0.110
 uvicorn[standard]>=0.29
 psycopg[binary]>=3.1
 cryptography>=42.0
+# Certificado digital: 'cryptography' cubre el modo 'pilot' (firma+cadena+vigencia).
+# Para el modo 'strict' (validación eIDAS completa con revocación OCSP/CRL), descomenta:
+# pyhanko-certvalidator>=0.26

@@ -22,6 +22,7 @@ import db
 import service as s
 import docs_service as ds
 import roles as rl
+import cert_service as cs
 
 app = FastAPI(title="Sfera Civitas — Desarrollo", version="0.1")
 _origins = os.environ.get("SFERA_CORS", "*").split(",")
@@ -34,6 +35,8 @@ _LIMITS = {  # (máx peticiones, ventana en segundos)
     "/api/register": (int(os.environ.get("SFERA_RL_REGISTER", "5")), 3600),
     "/api/login":    (int(os.environ.get("SFERA_RL_LOGIN", "20")), 900),
     "/api/verify":   (int(os.environ.get("SFERA_RL_VERIFY", "20")), 900),
+    "/api/cert/challenge": (int(os.environ.get("SFERA_RL_CERT", "10")), 900),
+    "/api/cert/verify":    (int(os.environ.get("SFERA_RL_CERT", "10")), 900),
 }
 
 
@@ -93,6 +96,11 @@ class VerifyIn(BaseModel):
     email: str; code: str
 class CertIn(BaseModel):
     email: str; cert_subject: str
+class CertChallengeIn(BaseModel):
+    email: str
+class CertVerifyIn(BaseModel):
+    email: str; nonce_id: int; signature: str; cert: str = ""
+    fmt: str = "raw"; signed_nonce: str = ""
 class LoginIn(BaseModel):
     email: str; password: str
 class ChangePwIn(BaseModel):
@@ -138,6 +146,21 @@ def register(i: RegisterIn): return _wrap(s.register, i.email, i.password)
 def verify(i: VerifyIn): return _wrap(s.verify, i.email, i.code)
 @app.post("/api/verify-certificate")
 def verify_certificate(i: CertIn): return _wrap(s.verify_certificate, i.email, i.cert_subject)
+
+# Certificado digital REAL (DNIe/FNMT/eIDAS) — reto-respuesta. Ver cert_service.py.
+def _wrap_cert(fn, *a, **k):
+    try:
+        return fn(*a, **k)
+    except cs.CertError as e:
+        raise HTTPException(e.code, e.msg)
+
+@app.get("/api/cert/status")
+def cert_status(): return cs.status()
+@app.post("/api/cert/challenge")
+def cert_challenge(i: CertChallengeIn): return _wrap_cert(cs.start_challenge, i.email)
+@app.post("/api/cert/verify")
+def cert_verify(i: CertVerifyIn):
+    return _wrap_cert(cs.verify, i.email, i.nonce_id, i.signature, i.cert, i.fmt, i.signed_nonce)
 @app.post("/api/login")
 def login(i: LoginIn): return _wrap(s.login, i.email, i.password)
 @app.post("/api/change-password")

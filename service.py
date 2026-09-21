@@ -242,8 +242,10 @@ def create_debate(title, body, materia, administracion, user) -> dict:
 
 
 def list_debates() -> list:
+    # No se listan los asuntos archivados (hidden=1): p.ej. datos de prueba.
     with db.session() as conn:
-        rows = [dict(r) for r in conn.execute("SELECT * FROM debates ORDER BY id DESC").fetchall()]
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM debates WHERE COALESCE(hidden,0)=0 ORDER BY id DESC").fetchall()]
     return rows
 
 

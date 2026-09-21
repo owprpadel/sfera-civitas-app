@@ -140,8 +140,21 @@ CREATE TABLE IF NOT EXISTS users (
   loa TEXT DEFAULT 'open',              -- nivel de garantía: 'open' (tipo X) | 'verified' (certificado)
   is_admin INTEGER DEFAULT 0,           -- rol de administrador (convocar/abrir/cerrar votaciones)
   is_expert INTEGER DEFAULT 0,          -- rol de experto (autoría de documentos oficiales)
-  cert_subject TEXT,                    -- identificador del certificado (DEV: simulado)
+  cert_subject TEXT,                    -- identificador legible del certificado (CN, solo referencia)
+  cert_pid TEXT,                        -- ID PSEUDÓNIMO = HMAC(secreto, NIF). NO guarda el NIF ni el certificado.
+                                        -- Desacopla identidad del voto: sirve para "una persona = una cuenta verificada".
+  cert_verified_at {REAL},              -- momento de la verificación con certificado real
   twofa_code TEXT,
+  created {REAL}
+);
+-- Retos de certificado (challenge-response). El cliente firma el nonce con su
+-- DNIe/certificado (AutoFirma) y el servidor verifica la firma sobre ESTE nonce.
+CREATE TABLE IF NOT EXISTS cert_challenges (
+  id {AUTOINC},
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  nonce TEXT NOT NULL,                  -- reto aleatorio (hex) que el cliente debe firmar
+  expires {REAL} NOT NULL,              -- caducidad (segundos epoch)
+  used INTEGER DEFAULT 0,               -- 1 tras consumirse (un solo uso)
   created {REAL}
 );
 CREATE TABLE IF NOT EXISTS debates (
@@ -151,6 +164,7 @@ CREATE TABLE IF NOT EXISTS debates (
   materia TEXT,
   administracion TEXT,
   phase TEXT DEFAULT 'convocar',
+  hidden INTEGER DEFAULT 0,             -- 1 = archivado (no se lista): p.ej. datos de prueba
   created {REAL}
 );
 CREATE TABLE IF NOT EXISTS arguments (
@@ -301,6 +315,9 @@ def init_db():
     if BACKEND == "postgres":
         conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin INTEGER DEFAULT 0")
         conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_expert INTEGER DEFAULT 0")
+        conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS cert_pid TEXT")
+        conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS cert_verified_at DOUBLE PRECISION")
+        conn.execute("ALTER TABLE debates ADD COLUMN IF NOT EXISTS hidden INTEGER DEFAULT 0")
         conn.commit()
         try:  # unique del tablón en tablas preexistentes (idempotente)
             conn.execute("ALTER TABLE bulletin_board ADD CONSTRAINT uq_bb_seq UNIQUE (election_id, seq)")
@@ -315,7 +332,55 @@ def init_db():
         if "is_expert" not in cols:
             conn._raw.execute("ALTER TABLE users ADD COLUMN is_expert INTEGER DEFAULT 0")  # type: ignore[attr-defined]
             conn.commit()
+        if "cert_pid" not in cols:
+            conn._raw.execute("ALTER TABLE users ADD COLUMN cert_pid TEXT")  # type: ignore[attr-defined]
+            conn.commit()
+        if "cert_verified_at" not in cols:
+            conn._raw.execute("ALTER TABLE users ADD COLUMN cert_verified_at REAL")  # type: ignore[attr-defined]
+            conn.commit()
+        dcols = [r[1] for r in conn._raw.execute("PRAGMA table_info(debates)").fetchall()]  # type: ignore[attr-defined]
+        if "hidden" not in dcols:
+            conn._raw.execute("ALTER TABLE debates ADD COLUMN hidden INTEGER DEFAULT 0")  # type: ignore[attr-defined]
+            conn.commit()
+    seed_and_clean(conn)
     conn.close()
+
+
+# Patrones de títulos de datos de PRUEBA (E2E) que NO deben mostrarse en producción.
+_TEST_TITLE_PREFIXES = ("Prueba E2E", "Voto real", "Sec E2E", "Asunto admin", "Test", "prueba")
+
+# Asuntos de EJEMPLO (buenos, concretos, no partidistas) para el piloto.
+_SEED_DEBATES = [
+    ("Ampliar el horario de las bibliotecas públicas en época de exámenes",
+     "¿Deberían las bibliotecas municipales ampliar su horario (noches y fines de semana) durante los periodos de exámenes? Coste, seguridad y demanda real sobre la mesa.",
+     "Cultura y Educación", "Ayuntamiento"),
+    ("Regulación de los patinetes eléctricos en el casco urbano",
+     "¿Cómo ordenar la circulación y el aparcamiento de patinetes eléctricos: velocidad, zonas permitidas y estacionamiento? Buscamos convivencia entre peatones, ciclistas y usuarios.",
+     "Movilidad", "Ayuntamiento"),
+    ("Uso de un solar público en desuso del barrio",
+     "Un solar municipal lleva años vacío. ¿Qué le damos: zona verde, aparcamiento, huerto urbano, espacio deportivo o pistas polivalentes? Decidimos con datos de coste y mantenimiento.",
+     "Urbanismo", "Ayuntamiento"),
+]
+
+
+def seed_and_clean(conn):
+    """Al arrancar: (1) archiva los asuntos de PRUEBA (no se listan) y (2) siembra
+    asuntos de ejemplo buenos si aún no existen. Idempotente. No borra nada."""
+    try:
+        # 1) Archivar datos de prueba (hidden=1). No se eliminan (auditabilidad).
+        for pref in _TEST_TITLE_PREFIXES:
+            conn.execute("UPDATE debates SET hidden=1 WHERE title LIKE ?", (pref + "%",))
+        # 2) Sembrar ejemplos si no están ya (por título).
+        for title, body, materia, admin in _SEED_DEBATES:
+            ex = conn.execute("SELECT id FROM debates WHERE title=?", (title,)).fetchone()
+            if not ex:
+                conn.execute(
+                    "INSERT INTO debates(title,body,materia,administracion,phase,hidden,created) "
+                    "VALUES(?,?,?,?,'deliberar',0,?)", (title, body, materia, admin, now()))
+        conn.commit()
+    except Exception:
+        try: conn._raw.rollback()
+        except Exception: pass
 
 
 def now() -> float:
