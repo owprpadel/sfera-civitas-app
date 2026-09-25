@@ -372,9 +372,19 @@ def _dec(s: str) -> str:
 
 # ── Envío de 2FA por email (SMTP opcional) ────────────────────────────────────
 def _send_email_async(to: str, subject: str, body: str) -> None:
-    """Envía en segundo plano para NO bloquear la respuesta HTTP (registro instantáneo)."""
+    """Envía en segundo plano (registro instantáneo) con REINTENTOS: si un envío
+    falla (proveedor caído/transitorio), reintenta un par de veces con espera, para
+    que el primer código de verificación no se quede sin salir."""
+    def _run():
+        for attempt in range(3):
+            try:
+                if _send_email(to, subject, body):
+                    return
+            except Exception:
+                pass
+            time.sleep(3)
     try:
-        threading.Thread(target=_send_email, args=(to, subject, body), daemon=True).start()
+        threading.Thread(target=_run, daemon=True).start()
     except Exception:
         _send_email(to, subject, body)
 
