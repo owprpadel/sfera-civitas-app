@@ -226,6 +226,18 @@ CREATE TABLE IF NOT EXISTS payments (
   created {REAL},
   UNIQUE (provider, external_id)
 );
+-- SOPORTE: tickets del buzón soporte@ (proceso desatendido: acuse + resolución/escalado).
+CREATE TABLE IF NOT EXISTS support_tickets (
+  id {AUTOINC},
+  msg_uid TEXT UNIQUE,                   -- UID IMAP (idempotencia: no reprocesar)
+  from_email TEXT,
+  subject TEXT,
+  body TEXT,
+  status TEXT DEFAULT 'nuevo',           -- nuevo | acuse | resuelto | escalado
+  resolution TEXT,
+  created {REAL},
+  updated {REAL}
+);
 -- AVISOS in-app: todo el proceso se informa dentro de la aplicación.
 CREATE TABLE IF NOT EXISTS notifications (
   id {AUTOINC},

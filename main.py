@@ -23,6 +23,7 @@ import service as s
 import docs_service as ds
 import roles as rl
 import cert_service as cs
+import support_service as sup
 
 app = FastAPI(title="Sfera Civitas — Desarrollo", version="0.1")
 _origins = os.environ.get("SFERA_CORS", "*").split(",")
@@ -177,6 +178,18 @@ def _wrap_cert(fn, *a, **k):
 
 @app.get("/api/cert/status")
 def cert_status(): return cs.status()
+# ── Soporte desatendido (soporte@): acuse + FAQ + escalado. Cron-key o admin. ──
+@app.post("/api/support/run")
+def support_run(x_sfera_cron: Optional[str] = Header(None),
+                authorization: Optional[str] = Header(None)):
+    cron = os.environ.get("SFERA_CRON_KEY")
+    if cron and x_sfera_cron == cron:
+        return sup.run_support_cycle()
+    admin_user(current_user(authorization))  # si no hay cron válida, exige admin
+    return sup.run_support_cycle()
+@app.get("/api/support/status")
+def support_status():
+    return {"configured": sup.configured(), "support_addr": sup.SUPPORT_ADDR}
 @app.post("/api/cert/challenge")
 def cert_challenge(i: CertChallengeIn): return _wrap_cert(cs.start_challenge, i.email)
 @app.post("/api/cert/verify")

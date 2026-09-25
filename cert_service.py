@@ -157,11 +157,19 @@ def verify(email: str, nonce_id, signature_b64: str, cert_pem: str,
     nonce_bytes = nonce.encode()
 
     # a) obtener el certificado del firmante y verificar la firma sobre el nonce
-    cert = _load_signer_cert(cert_pem, sig, fmt)
-    _verify_signature(cert, sig, nonce_bytes, fmt)
+    if fmt == "pkcs7":
+        # AutoFirma/DNIe firman en CAdES (CMS/PKCS#7 detached): verificamos el CMS
+        # (messageDigest == hash(nonce) + firma de los signedAttrs con la clave del
+        # certificado firmante) y de ahí extraemos el certificado del ciudadano y
+        # los intermedios que la propia firma incluye (para encadenar hasta la raíz).
+        cert, chain_certs = _verify_cms_detached(sig, nonce_bytes)
+    else:
+        cert = _load_signer_cert(cert_pem, sig, fmt)
+        _verify_signature(cert, sig, nonce_bytes, fmt)
+        chain_certs = []
 
     # b) validar el certificado (vigencia + cadena + revocación según modo)
-    _validate_certificate(cert)
+    _validate_certificate(cert, chain_certs)
 
     # c) identidad → pid pseudónimo (NO se guarda el NIF)
     nif, display = _extract_identity(cert)
@@ -253,19 +261,131 @@ def _verify_signature(cert, sig: bytes, nonce_bytes: bytes, fmt: str):
         raise CertError(401, "La firma no corresponde al reto emitido")
 
 
+# ---------------------------------------------------------------------------
+# Verificación CMS/PKCS#7 detached (CAdES de AutoFirma/DNIe) — Python puro,
+# sin dependencias nuevas. Verifica que messageDigest == hash(nonce) y que la
+# firma de los signedAttrs valida con la clave pública del certificado firmante.
+# ---------------------------------------------------------------------------
+_OID_MSGDIGEST = b"\x2a\x86\x48\x86\xf7\x0d\x01\x09\x04"   # 1.2.840.113549.1.9.4
+_CMS_HASHES = {
+    "2.16.840.1.101.3.4.2.1": ("sha256", None),
+    "2.16.840.1.101.3.4.2.2": ("sha384", None),
+    "2.16.840.1.101.3.4.2.3": ("sha512", None),
+    "1.3.14.3.2.26":          ("sha1",   None),
+}
+
+
+def _der_read(data, off):
+    tag = data[off]; o = off + 1
+    f = data[o]; o += 1
+    if f & 0x80:
+        n = f & 0x7f
+        length = int.from_bytes(data[o:o + n], "big"); o += n
+    else:
+        length = f
+    end = o + length
+    return {"tag": tag, "val": data[o:end], "full": data[off:end]}, end
+
+
+def _der_children(val):
+    out, off = [], 0
+    while off < len(val):
+        node, off = _der_read(val, off)
+        out.append(node)
+    return out
+
+
+def _der_oid_str(b):
+    first = b[0]; res = [str(first // 40), str(first % 40)]; n = 0
+    for c in b[1:]:
+        n = (n << 7) | (c & 0x7f)
+        if not c & 0x80:
+            res.append(str(n)); n = 0
+    return ".".join(res)
+
+
+def _verify_cms_detached(sig_der: bytes, content: bytes):
+    """Verifica una firma CMS/PKCS#7 detached sobre `content` (el nonce) y
+    devuelve el x509.Certificate del firmante. Lanza CertError si algo falla."""
+    try:
+        ci, _ = _der_read(sig_der, 0)                       # ContentInfo SEQUENCE
+        c = _der_children(ci["val"])                        # [OID, [0] EXPLICIT]
+        signed_data = _der_children(c[1]["val"])[0]         # SignedData SEQUENCE
+        sd = _der_children(signed_data["val"])
+        certs_node = next((x for x in sd if x["tag"] == 0xA0), None)
+        signerinfos = [x for x in sd if x["tag"] == 0x31][-1]
+        si = _der_children(_der_children(signerinfos["val"])[0]["val"])
+        digest_oid = _der_oid_str(_der_children(si[2]["val"])[0]["val"])
+        signed_attrs = next((x for x in si if x["tag"] == 0xA0), None)
+        sig_octet = [x for x in si if x["tag"] == 0x04][-1]
+        signature = sig_octet["val"]
+    except CertError:
+        raise
+    except Exception:
+        raise CertError(400, "Firma PKCS#7/CAdES ilegible")
+    if digest_oid not in _CMS_HASHES:
+        raise CertError(415, "Algoritmo de hash del CMS no soportado")
+    hname = _CMS_HASHES[digest_oid][0]
+    hcls = {"sha256": hashes.SHA256, "sha384": hashes.SHA384,
+            "sha512": hashes.SHA512, "sha1": hashes.SHA1}[hname]
+    if signed_attrs is None or certs_node is None:
+        raise CertError(415, "CMS sin signedAttrs o sin certificado del firmante")
+    try:
+        all_certs = []
+        for cnode in _der_children(certs_node["val"]):
+            try:
+                all_certs.append(x509.load_der_x509_certificate(cnode["full"]))
+            except Exception:
+                continue
+        if not all_certs:
+            raise CertError(400, "No hay certificados en el CMS")
+        # firmante = la hoja (el que no es CA); si no se distingue, el primero
+        signer = next((c for c in all_certs if _is_leaf(c)), all_certs[0])
+    except CertError:
+        raise
+    except Exception:
+        raise CertError(400, "No se pudo leer el certificado del firmante en el CMS")
+    # messageDigest == hash(nonce)
+    md_expected = hashlib.new(hname, content).digest()
+    md_found = None
+    for attr in _der_children(signed_attrs["val"]):
+        ac = _der_children(attr["val"])
+        if ac and ac[0]["val"] == _OID_MSGDIGEST:
+            md_found = _der_children(ac[1]["val"])[0]["val"]
+    if md_found != md_expected:
+        raise CertError(401, "El resumen firmado no corresponde al reto (messageDigest)")
+    # firma de los signedAttrs (re-etiquetados como SET 0x31)
+    sa = b"\x31" + signed_attrs["full"][1:]
+    pub = signer.public_key()
+    try:
+        if isinstance(pub, rsa.RSAPublicKey):
+            pub.verify(signature, sa, padding.PKCS1v15(), hcls())
+        elif isinstance(pub, ec.EllipticCurvePublicKey):
+            pub.verify(signature, sa, ec.ECDSA(hcls()))
+        else:
+            raise CertError(415, "Tipo de clave del certificado no soportado")
+    except InvalidSignature:
+        raise CertError(401, "La firma CAdES no corresponde al reto emitido")
+    return signer, all_certs
+
+
 def _load_trust_roots():
-    """Carga las CAs de confianza (PEM) del directorio de confianza."""
+    """Carga las CAs de confianza del directorio de confianza. Acepta PEM (uno o
+    varios por fichero) y DER (.cer/.crt/.der tal como los publica la FNMT/DNIe)."""
     roots = []
     if not os.path.isdir(TRUSTDIR):
         return roots
     for fn in os.listdir(TRUSTDIR):
-        if not fn.lower().endswith((".pem", ".crt", ".cer")):
+        if not fn.lower().endswith((".pem", ".crt", ".cer", ".der")):
             continue
         try:
             with open(os.path.join(TRUSTDIR, fn), "rb") as fh:
                 blob = fh.read()
-            for part in _split_pem(blob):
-                roots.append(x509.load_pem_x509_certificate(part))
+            if b"-----BEGIN CERTIFICATE-----" in blob:
+                for part in _split_pem(blob):
+                    roots.append(x509.load_pem_x509_certificate(part))
+            else:
+                roots.append(x509.load_der_x509_certificate(blob))  # DER (.cer)
         except Exception:
             continue
     return roots
@@ -283,8 +403,11 @@ def _split_pem(blob: bytes):
     return out
 
 
-def _validate_certificate(cert):
-    """Vigencia + cadena hasta una CA de confianza (+ revocación en 'strict')."""
+def _validate_certificate(cert, extra_certs=()):
+    """Vigencia + cadena hasta una CA de confianza (+ revocación en 'strict').
+    `extra_certs` son los certificados intermedios que la firma (CMS de AutoFirma)
+    incluye: permiten encadenar hasta la RAÍZ aunque el emisor directo sea una
+    intermedia, de modo que en el trust_store baste con las raíces."""
     import datetime
     now = datetime.datetime.now(datetime.timezone.utc)
     naf = getattr(cert, "not_valid_after_utc", None) or cert.not_valid_after.replace(tzinfo=datetime.timezone.utc)
@@ -303,7 +426,8 @@ def _validate_certificate(cert):
             raise CertError(500, "Modo estricto sin CAs de confianza configuradas (SFERA_CERT_TRUSTDIR)")
         try:
             trust = [r.public_bytes(serialization.Encoding.DER) for r in roots]
-            ctx = ValidationContext(trust_roots=trust, allow_fetching=True)
+            inter = [c.public_bytes(serialization.Encoding.DER) for c in extra_certs if c.subject != c.issuer]
+            ctx = ValidationContext(trust_roots=trust, other_certs=inter, allow_fetching=True)
             der = cert.public_bytes(serialization.Encoding.DER)
             CertificateValidator(der, validation_context=ctx).validate_usage(set())
         except CertError:
@@ -312,19 +436,31 @@ def _validate_certificate(cert):
             raise CertError(403, f"Validación eIDAS fallida (cadena/revocación): {e}")
         return
 
-    # modo 'pilot': cadena best-effort — el emisor debe estar entre las CAs de
-    # confianza y su firma sobre el certificado debe verificar. Si no hay CAs
-    # configuradas todavía, se acepta con vigencia comprobada y se deja aviso.
+    # modo 'pilot': construye la cadena desde el certificado hacia arriba usando
+    # los intermedios incluidos en la firma, hasta llegar a una RAÍZ de confianza.
+    # Verifica la firma de cada eslabón. Sin trust store aún: solo vigencia.
     if not roots:
         return  # piloto sin trust store: solo vigencia + firma del nonce ya verificada
-    issuer = cert.issuer
-    for ca in roots:
-        if ca.subject == issuer:
+    root_subjects = {r.subject: r for r in roots}
+    inter_subjects = {c.subject: c for c in extra_certs}
+    cur = cert
+    for _ in range(10):  # límite de profundidad
+        # ¿el emisor actual es una raíz de confianza?
+        if cur.issuer in root_subjects:
             try:
-                _verify_cert_signed_by(cert, ca)
-                return
+                _verify_cert_signed_by(cur, root_subjects[cur.issuer])
+                return  # cadena válida hasta la raíz
             except Exception:
-                continue
+                raise CertError(403, "Cadena inválida: la raíz no firma el certificado")
+        # si no, subimos por un intermedio incluido en la firma
+        nxt = inter_subjects.get(cur.issuer)
+        if not nxt or nxt is cur:
+            break
+        try:
+            _verify_cert_signed_by(cur, nxt)
+        except Exception:
+            raise CertError(403, "Cadena inválida en un eslabón intermedio")
+        cur = nxt
     raise CertError(403, "El certificado no encadena con ninguna CA de confianza (FNMT/DNIe/eIDAS)")
 
 
