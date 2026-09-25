@@ -36,6 +36,7 @@ _LIMITS = {  # (máx peticiones, ventana en segundos)
     "/api/register": (int(os.environ.get("SFERA_RL_REGISTER", "5")), 3600),
     "/api/login":    (int(os.environ.get("SFERA_RL_LOGIN", "20")), 900),
     "/api/verify":   (int(os.environ.get("SFERA_RL_VERIFY", "20")), 900),
+    "/api/resend":   (int(os.environ.get("SFERA_RL_RESEND", "5")), 900),
     "/api/cert/challenge": (int(os.environ.get("SFERA_RL_CERT", "10")), 900),
     "/api/cert/verify":    (int(os.environ.get("SFERA_RL_CERT", "10")), 900),
 }
@@ -109,6 +110,8 @@ class RegisterIn(BaseModel):
     email: str; password: str
 class VerifyIn(BaseModel):
     email: str; code: str
+class ResendIn(BaseModel):
+    email: str
 class CertIn(BaseModel):
     email: str; cert_subject: str
 class CertChallengeIn(BaseModel):
@@ -166,6 +169,8 @@ class ContribIn(BaseModel):
 def register(i: RegisterIn): return _wrap(s.register, i.email, i.password)
 @app.post("/api/verify")
 def verify(i: VerifyIn): return _wrap(s.verify, i.email, i.code)
+@app.post("/api/resend")
+def resend(i: ResendIn): return _wrap(s.resend_code, i.email)
 @app.post("/api/verify-certificate")
 def verify_certificate(i: CertIn): return _wrap(s.verify_certificate, i.email, i.cert_subject)
 

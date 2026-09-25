@@ -26,6 +26,7 @@ import json
 import os
 import secrets
 import smtplib
+import threading
 import time
 from email.message import EmailMessage
 from time import gmtime, strftime
@@ -370,11 +371,40 @@ def _dec(s: str) -> str:
 
 
 # ── Envío de 2FA por email (SMTP opcional) ────────────────────────────────────
+def _send_email_async(to: str, subject: str, body: str) -> None:
+    """Envía en segundo plano para NO bloquear la respuesta HTTP (registro instantáneo)."""
+    try:
+        threading.Thread(target=_send_email, args=(to, subject, body), daemon=True).start()
+    except Exception:
+        _send_email(to, subject, body)
+
+
 def _send_2fa_email(to: str, code: str) -> bool:
-    # Delegado al emisor multi-proveedor (Resend/Brevo/SMTP). _send_email se define
-    # más abajo en el módulo; se resuelve en tiempo de ejecución.
-    return _send_email(to, "Tu código de acceso a Sfera Civitas",
-                       f"Tu código de verificación es: {code}\n\nSi no lo has solicitado, ignora este mensaje.")
+    # Envío ASÍNCRONO del código para que el registro responda al instante.
+    # Devuelve si hay proveedor de correo configurado (para la coherencia del piloto).
+    _send_email_async(to, "Tu código de acceso a Sfera Civitas",
+                      f"Tu código de verificación es: {code}\n\nSi no lo has solicitado, ignora este mensaje.")
+    return _mail_configured()
+
+
+def resend_code(email: str) -> dict:
+    """Reenvía un código de verificación NUEVO a una cuenta no verificada (rápido, async)."""
+    email = (email or "").strip().lower()
+    with db.session() as conn:
+        row = conn.execute("SELECT id, verified FROM users WHERE email=?", (email,)).fetchone()
+        if not row:
+            raise SferaError(404, "No hay ninguna cuenta con ese email")
+        row = dict(row)
+        if row.get("verified"):
+            return {"ok": True, "already_verified": True}
+        code = f"{secrets.randbelow(1000000):06d}"
+        conn.execute("UPDATE users SET twofa_code=? WHERE id=?", (code, row["id"]))
+        conn.commit()
+    sent = _send_2fa_email(email, code)
+    out = {"ok": True, "email_enviado": sent}
+    if not _mail_configured():
+        out["codigo_piloto"] = code
+    return out
 
 
 def get_user(uid) -> dict:
