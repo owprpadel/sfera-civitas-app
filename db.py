@@ -169,6 +169,7 @@ CREATE TABLE IF NOT EXISTS debates (
   cierre {REAL},                        -- fecha límite de la votación (epoch); NULL si no está en votación
   hidden INTEGER DEFAULT 0,             -- 1 = archivado (no se lista): p.ej. datos de prueba
   visibility TEXT DEFAULT 'public',     -- 'public' (democracia directa) | 'private' (colectivo de pago)
+  org_id INTEGER,                       -- organización propietaria si es privado (NULL = público)
   created_by INTEGER,                   -- proponente (ciudadano que convoca)
   conv_status TEXT DEFAULT 'recabando', -- CONVOCATORIA (fase 0): recabando | avanzado | caducado
   conv_deadline {REAL},                 -- fecha límite para reunir el quórum (createdAt + 2 semanas)
@@ -183,6 +184,47 @@ CREATE TABLE IF NOT EXISTS supports (
   via TEXT NOT NULL,                    -- 'abierto' (email) | 'verificado' (certificado/Cl@ve/DNIe)
   created {REAL},
   PRIMARY KEY (debate_id, user_id)
+);
+-- PARTE PRIVADA (colectivos de pago): organizaciones, censo por invitación del organizador.
+CREATE TABLE IF NOT EXISTS organizations (
+  id {AUTOINC},
+  name TEXT NOT NULL,
+  owner_id INTEGER NOT NULL REFERENCES users(id),
+  plan TEXT DEFAULT 'trial',            -- estado de suscripción/uso: trial | active | suspended
+  paid_units INTEGER DEFAULT 0,         -- unidades de uso pagadas acumuladas (pago por uso)
+  active_until {REAL},                  -- si el modelo es por periodo, hasta cuándo está activo
+  created {REAL}
+);
+CREATE TABLE IF NOT EXISTS org_members (
+  org_id INTEGER NOT NULL REFERENCES organizations(id),
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  role TEXT NOT NULL DEFAULT 'member',  -- owner | member
+  created {REAL},
+  PRIMARY KEY (org_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS org_invites (
+  id {AUTOINC},
+  org_id INTEGER NOT NULL REFERENCES organizations(id),
+  email TEXT NOT NULL,
+  token TEXT NOT NULL,
+  used INTEGER DEFAULT 0,
+  created {REAL}
+);
+-- PAGO POR USO (Merchant of Record: Lemon Squeezy / Paddle / Polar). Registro de
+-- transacciones recibidas por webhook, verificadas por firma. Idempotente por external_id.
+CREATE TABLE IF NOT EXISTS payments (
+  id {AUTOINC},
+  org_id INTEGER REFERENCES organizations(id),
+  provider TEXT NOT NULL,                -- lemonsqueezy | paddle | polar
+  external_id TEXT NOT NULL,             -- id de la transacción/pedido en el proveedor
+  status TEXT,                           -- paid | refunded | ...
+  amount_cents INTEGER DEFAULT 0,
+  currency TEXT DEFAULT 'EUR',
+  units INTEGER DEFAULT 0,               -- unidades de uso adquiridas (según criterio publicado)
+  email TEXT,
+  raw TEXT,                              -- payload íntegro para auditoría
+  created {REAL},
+  UNIQUE (provider, external_id)
 );
 -- AVISOS in-app: todo el proceso se informa dentro de la aplicación.
 CREATE TABLE IF NOT EXISTS notifications (
@@ -354,6 +396,10 @@ def init_db():
         conn.execute("ALTER TABLE debates ADD COLUMN IF NOT EXISTS conv_status TEXT DEFAULT 'recabando'")
         conn.execute("ALTER TABLE debates ADD COLUMN IF NOT EXISTS conv_deadline DOUBLE PRECISION")
         conn.execute("ALTER TABLE debates ADD COLUMN IF NOT EXISTS qualified_track TEXT")
+        conn.execute("ALTER TABLE debates ADD COLUMN IF NOT EXISTS org_id INTEGER")
+        # Pago por uso (parte privada)
+        conn.execute("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS paid_units INTEGER DEFAULT 0")
+        conn.execute("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS active_until DOUBLE PRECISION")
         conn.commit()
         try:  # unique del tablón en tablas preexistentes (idempotente)
             conn.execute("ALTER TABLE bulletin_board ADD CONSTRAINT uq_bb_seq UNIQUE (election_id, seq)")
@@ -392,10 +438,22 @@ def init_db():
                          ("created_by", "ALTER TABLE debates ADD COLUMN created_by INTEGER"),
                          ("conv_status", "ALTER TABLE debates ADD COLUMN conv_status TEXT DEFAULT 'recabando'"),
                          ("conv_deadline", "ALTER TABLE debates ADD COLUMN conv_deadline REAL"),
-                         ("qualified_track", "ALTER TABLE debates ADD COLUMN qualified_track TEXT")):
+                         ("qualified_track", "ALTER TABLE debates ADD COLUMN qualified_track TEXT"),
+                         ("org_id", "ALTER TABLE debates ADD COLUMN org_id INTEGER")):
             if col not in dcols:
                 conn._raw.execute(ddl)  # type: ignore[attr-defined]
                 conn.commit()
+        # Pago por uso (parte privada)
+        try:
+            ocols = [r[1] for r in conn._raw.execute("PRAGMA table_info(organizations)").fetchall()]  # type: ignore[attr-defined]
+            if "paid_units" not in ocols:
+                conn._raw.execute("ALTER TABLE organizations ADD COLUMN paid_units INTEGER DEFAULT 0")  # type: ignore[attr-defined]
+                conn.commit()
+            if "active_until" not in ocols:
+                conn._raw.execute("ALTER TABLE organizations ADD COLUMN active_until REAL")  # type: ignore[attr-defined]
+                conn.commit()
+        except Exception:
+            pass
     seed_and_clean(conn)
     conn.close()
 

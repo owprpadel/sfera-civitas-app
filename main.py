@@ -89,6 +89,20 @@ def admin_user(u=Depends(current_user)) -> dict:
     return u
 
 
+def optional_user(authorization: Optional[str] = Header(None)):
+    """Usuario si hay sesión válida; None si no. Para rutas públicas que además
+    dan acceso extra a miembros (p. ej. asuntos privados)."""
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    uid = s.parse_token(authorization[len("Bearer "):].strip())
+    if uid is None:
+        return None
+    try:
+        return s.get_user(uid)
+    except Exception:
+        return None
+
+
 # ── modelos ──────────────────────────────────────────────────────────────────
 class RegisterIn(BaseModel):
     email: str; password: str
@@ -107,7 +121,13 @@ class ChangePwIn(BaseModel):
     old_password: str; new_password: str
 class DebateIn(BaseModel):
     title: str; body: str = ""; materia: str = ""; administracion: str = ""
-    nivel: str = ""; territorio: str = ""
+    nivel: str = ""; territorio: str = ""; org_id: Optional[int] = None
+class OrgIn(BaseModel):
+    name: str
+class OrgInviteIn(BaseModel):
+    email: str
+class InviteAcceptIn(BaseModel):
+    token: str
 class PhaseIn(BaseModel):
     phase: str
 class ArgIn(BaseModel):
@@ -172,7 +192,7 @@ def change_password(i: ChangePwIn, u=Depends(current_user)):
 # ── debates / fases ──────────────────────────────────────────────────────────
 @app.post("/api/debates")
 def create_debate(i: DebateIn, u=Depends(current_user)):
-    return _wrap(s.create_debate, i.title, i.body, i.materia, i.administracion, u, i.nivel, i.territorio)
+    return _wrap(s.create_debate, i.title, i.body, i.materia, i.administracion, u, i.nivel, i.territorio, i.org_id)
 @app.get("/api/debates")
 def list_debates(): return s.list_debates()
 @app.get("/api/config")
@@ -181,8 +201,32 @@ def get_config(): return s.get_config()
 def list_notifications(u=Depends(current_user)): return _wrap(s.list_notifications, u)
 @app.post("/api/notifications/read")
 def mark_notifications_read(u=Depends(current_user)): return _wrap(s.mark_notifications_read, u)
+# ── Parte privada: organizaciones ─────────────────────────────────────────────
+@app.post("/api/orgs")
+def create_org(i: OrgIn, u=Depends(current_user)): return _wrap(s.create_org, u, i.name)
+@app.get("/api/orgs")
+def list_orgs(u=Depends(current_user)): return _wrap(s.list_my_orgs, u)
+@app.post("/api/orgs/{oid}/invite")
+def invite_member(oid: int, i: OrgInviteIn, u=Depends(current_user)): return _wrap(s.invite_member, u, oid, i.email)
+@app.post("/api/orgs/invites/accept")
+def accept_invite(i: InviteAcceptIn, u=Depends(current_user)): return _wrap(s.accept_invite, u, i.token)
+@app.get("/api/orgs/{oid}/members")
+def org_members(oid: int, u=Depends(current_user)): return _wrap(s.list_org_members, u, oid)
+@app.get("/api/orgs/{oid}/debates")
+def org_debates(oid: int, u=Depends(current_user)): return _wrap(s.list_org_debates, u, oid)
+# ── Pago por uso (parte privada) · Merchant of Record ─────────────────────────
+@app.get("/api/billing/config")
+def billing_config(): return s.billing_config()
+@app.get("/api/orgs/{oid}/billing")
+def org_billing(oid: int, u=Depends(current_user)): return _wrap(s.get_org_billing, u, oid)
+@app.post("/api/orgs/{oid}/checkout")
+def org_checkout(oid: int, u=Depends(current_user)): return _wrap(s.create_checkout, u, oid)
+@app.post("/api/billing/webhook/{provider}")
+async def billing_webhook(provider: str, request: Request):
+    raw = await request.body()
+    return _wrap(s.handle_webhook, provider, dict(request.headers), raw)
 @app.get("/api/debates/{did}")
-def get_debate(did: int): return _wrap(s.get_debate, did)
+def get_debate(did: int, u=Depends(optional_user)): return _wrap(s.get_debate, did, u)
 @app.post("/api/debates/{did}/support")
 def support_debate(did: int, u=Depends(current_user)): return _wrap(s.support_debate, did, u)
 @app.post("/api/debates/{did}/phase")

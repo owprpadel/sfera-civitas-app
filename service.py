@@ -103,6 +103,7 @@ def get_config() -> dict:
         "conv_dias": CONV_DIAS,
         "conv_quorum_abierto": CONV_QUORUM,
         "conv_quorum_verificado": CONV_QUORUM_VERIF,
+        "privado": billing_config(),
     }
 
 
@@ -110,26 +111,118 @@ def get_config() -> dict:
 APP_URL = os.environ.get("SFERA_APP_URL", "https://app.sferacivitas.org")
 
 
+MAIL_FROM = os.environ.get("SFERA_MAIL_FROM", os.environ.get("SFERA_SMTP_FROM", "verificacion@sferacivitas.org"))
+
+
+# ── PAGO POR USO (parte privada) · Merchant of Record ─────────────────────────
+# Proveedor por defecto: Lemon Squeezy (MoR: gestiona IVA/impuestos de cada país,
+# sin anclaje fiscal español; sin cuota fija). Intercambiable por Paddle/Polar
+# cambiando SFERA_BILLING_PROVIDER y las claves. NADA de esto expone secretos:
+# las claves viven en variables de entorno que aporta Carlos (no en el código).
+BILLING_PROVIDER = os.environ.get("SFERA_BILLING_PROVIDER", "lemonsqueezy").lower()
+# Criterio de precio PUBLICADO (transparente). El importe es decisión de negocio:
+# se deja como variable; si vale 0 la UI muestra "por definir" (no inventamos cifras).
+PRICE_CENTS = int(os.environ.get("SFERA_PRICE_CENTS", "0"))          # p.ej. 200 = 2,00
+PRICE_CURRENCY = os.environ.get("SFERA_PRICE_CURRENCY", "EUR")
+PRICE_UNIT = os.environ.get("SFERA_PRICE_UNIT", "asunto privado")    # unidad de uso
+PRICE_UNITS_PER_PURCHASE = int(os.environ.get("SFERA_PRICE_UNITS", "1"))
+BILLING_CRITERION = os.environ.get(
+    "SFERA_BILLING_CRITERION",
+    "La parte privada se cobra por uso, sin mínimos: se paga por cada unidad de uso "
+    "(por defecto, por asunto privado creado). El importe y la unidad se publican aquí "
+    "y no cambian sin aviso. Los impuestos aplicables de cada país los gestiona el "
+    "proveedor de pago (Merchant of Record).")
+
+# Lemon Squeezy
+LS_API_KEY = os.environ.get("SFERA_LS_API_KEY", "")
+LS_STORE_ID = os.environ.get("SFERA_LS_STORE_ID", "")
+LS_VARIANT_ID = os.environ.get("SFERA_LS_VARIANT_ID", "")
+LS_WEBHOOK_SECRET = os.environ.get("SFERA_LS_WEBHOOK_SECRET", "")
+LS_CHECKOUT_URL = os.environ.get("SFERA_LS_CHECKOUT_URL", "")  # enlace de checkout alojado (alternativa a la API)
+
+# Paddle / Polar (claves genéricas; verificación de firma específica por proveedor)
+PADDLE_WEBHOOK_SECRET = os.environ.get("SFERA_PADDLE_WEBHOOK_SECRET", "")
+POLAR_WEBHOOK_SECRET = os.environ.get("SFERA_POLAR_WEBHOOK_SECRET", "")
+
+
 def _send_email(to: str, subject: str, body: str) -> bool:
+    """Envía un email por la primera vía configurada: (1) API HTTP Resend,
+    (2) API HTTP Brevo, (3) SMTP. Sin ninguna configurada -> False (modo piloto).
+    Usa solo stdlib (urllib) para las APIs, sin dependencias nuevas."""
+    if not to:
+        return False
+    import json as _json, urllib.request as _rq
+    # (1) Resend (https://resend.com) — SFERA_RESEND_KEY
+    rk = os.environ.get("SFERA_RESEND_KEY")
+    if rk:
+        try:
+            req = _rq.Request("https://api.resend.com/emails",
+                data=_json.dumps({"from": MAIL_FROM, "to": [to], "subject": subject, "text": body}).encode(),
+                headers={"Authorization": "Bearer " + rk, "Content-Type": "application/json"}, method="POST")
+            with _rq.urlopen(req, timeout=12) as r:
+                if r.status in (200, 201): return True
+        except Exception:
+            pass
+    # (2) Brevo (https://brevo.com) — SFERA_BREVO_KEY
+    bk = os.environ.get("SFERA_BREVO_KEY")
+    if bk:
+        try:
+            req = _rq.Request("https://api.brevo.com/v3/smtp/email",
+                data=_json.dumps({"sender": {"email": MAIL_FROM}, "to": [{"email": to}],
+                                  "subject": subject, "textContent": body}).encode(),
+                headers={"api-key": bk, "Content-Type": "application/json", "accept": "application/json"}, method="POST")
+            with _rq.urlopen(req, timeout=12) as r:
+                if r.status in (200, 201): return True
+        except Exception:
+            pass
+    # (3) ZeptoMail (transaccional de Zoho, https://zeptomail.eu) — SFERA_ZEPTO_KEY
+    #     Ideal para VOLUMEN: reputación de envío dedicada, no toca el buzón hola@.
+    #     La región por defecto es .eu (cuenta europea); configurable con SFERA_ZEPTO_HOST.
+    zk = os.environ.get("SFERA_ZEPTO_KEY")
+    if zk:
+        try:
+            zhost = os.environ.get("SFERA_ZEPTO_HOST", "api.zeptomail.eu")
+            req = _rq.Request(f"https://{zhost}/v1.1/email",
+                data=_json.dumps({"from": {"address": MAIL_FROM},
+                                  "to": [{"email_address": {"address": to}}],
+                                  "subject": subject, "textbody": body}).encode(),
+                headers={"Authorization": zk if zk.lower().startswith("zoho-enczapikey") else ("Zoho-enczapikey " + zk),
+                         "Content-Type": "application/json", "accept": "application/json"}, method="POST")
+            with _rq.urlopen(req, timeout=12) as r:
+                if r.status in (200, 201): return True
+        except Exception:
+            pass
+    # (4) SMTP — SFERA_SMTP_HOST/USER/PASSWORD (p.ej. Zoho: smtp.zoho.eu)
+    #     Puerto 465 -> SSL directo; 587 (u otro) -> STARTTLS.
     host = os.environ.get("SFERA_SMTP_HOST")
-    if not host or not to:
-        return False
-    try:
-        msg = EmailMessage()
-        msg["Subject"] = subject
-        msg["From"] = os.environ.get("SFERA_SMTP_FROM", "no-reply@sferacivitas.org")
-        msg["To"] = to
-        msg.set_content(body)
-        port = int(os.environ.get("SFERA_SMTP_PORT", "587"))
-        with smtplib.SMTP(host, port, timeout=10) as srv:
-            srv.starttls()
+    if host:
+        try:
+            msg = EmailMessage()
+            msg["Subject"] = subject; msg["From"] = MAIL_FROM; msg["To"] = to
+            msg.set_content(body)
+            port = int(os.environ.get("SFERA_SMTP_PORT", "587"))
             user = os.environ.get("SFERA_SMTP_USER")
-            if user:
-                srv.login(user, os.environ.get("SFERA_SMTP_PASSWORD", ""))
-            srv.send_message(msg)
-        return True
-    except Exception:
-        return False
+            pwd = os.environ.get("SFERA_SMTP_PASSWORD", "")
+            if port == 465:
+                with smtplib.SMTP_SSL(host, port, timeout=15) as srv:
+                    if user: srv.login(user, pwd)
+                    srv.send_message(msg)
+            else:
+                with smtplib.SMTP(host, port, timeout=15) as srv:
+                    srv.starttls()
+                    if user: srv.login(user, pwd)
+                    srv.send_message(msg)
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def _mail_configured() -> bool:
+    """True si hay algún proveedor de correo configurado (para dejar de mostrar
+    el código en modo piloto y decir con honestidad que llega por email)."""
+    return any(os.environ.get(k) for k in
+               ("SFERA_RESEND_KEY", "SFERA_BREVO_KEY", "SFERA_ZEPTO_KEY", "SFERA_SMTP_HOST"))
 
 
 def _notify(conn, user_id, kind, debate_id, text):
@@ -278,25 +371,10 @@ def _dec(s: str) -> str:
 
 # ── Envío de 2FA por email (SMTP opcional) ────────────────────────────────────
 def _send_2fa_email(to: str, code: str) -> bool:
-    host = os.environ.get("SFERA_SMTP_HOST")
-    if not host:
-        return False
-    try:
-        msg = EmailMessage()
-        msg["Subject"] = "Tu código de acceso a Sfera Civitas"
-        msg["From"] = os.environ.get("SFERA_SMTP_FROM", "no-reply@sferacivitas.org")
-        msg["To"] = to
-        msg.set_content(f"Tu código de verificación es: {code}\n\nSi no lo has solicitado, ignora este mensaje.")
-        port = int(os.environ.get("SFERA_SMTP_PORT", "587"))
-        with smtplib.SMTP(host, port, timeout=10) as s:
-            s.starttls()
-            user = os.environ.get("SFERA_SMTP_USER")
-            if user:
-                s.login(user, os.environ.get("SFERA_SMTP_PASSWORD", ""))
-            s.send_message(msg)
-        return True
-    except Exception:
-        return False
+    # Delegado al emisor multi-proveedor (Resend/Brevo/SMTP). _send_email se define
+    # más abajo en el módulo; se resuelve en tiempo de ejecución.
+    return _send_email(to, "Tu código de acceso a Sfera Civitas",
+                       f"Tu código de verificación es: {code}\n\nSi no lo has solicitado, ignora este mensaje.")
 
 
 def get_user(uid) -> dict:
@@ -392,16 +470,356 @@ def change_password(uid, old_password: str, new_password: str) -> dict:
 
 
 # ── Debates / fases ──────────────────────────────────────────────────────────
-def create_debate(title, body, materia, administracion, user, nivel="", territorio="") -> dict:
-    """Convocar un asunto (Fase 0). DOCTRINA: cualquier ciudadano registrado puede
-    proponer un asunto en el ámbito PÚBLICO; nace en fase 'convocar' y tiene
-    CONV_DIAS para reunir el quórum en alguna de las dos vías. El proponente
-    apoya automáticamente en su vía."""
+# ── PARTE PRIVADA: organizaciones (colectivos de pago) ────────────────────────
+def _is_org_member(conn, org_id, user_id) -> bool:
+    return bool(conn.execute("SELECT 1 FROM org_members WHERE org_id=? AND user_id=?",
+                             (org_id, user_id)).fetchone())
+
+
+def _org_role(conn, org_id, user_id):
+    r = conn.execute("SELECT role FROM org_members WHERE org_id=? AND user_id=?", (org_id, user_id)).fetchone()
+    return (dict(r)["role"] if r else None)
+
+
+def create_org(user, name: str) -> dict:
+    """Crea una organización privada; el creador es 'owner' (organizador)."""
+    if not (name or "").strip():
+        raise SferaError(400, "La organización necesita un nombre")
+    now = db.now()
+    with db.session() as conn:
+        cur = conn.execute("INSERT INTO organizations(name,owner_id,plan,created) VALUES(?,?,'trial',?)",
+                           (name.strip(), user["id"], now), returning=True)
+        oid = cur.lastrowid
+        conn.execute("INSERT INTO org_members(org_id,user_id,role,created) VALUES(?,?,'owner',?)",
+                     (oid, user["id"], now))
+        conn.commit()
+    return {"org_id": oid, "name": name.strip(), "role": "owner", "plan": "trial"}
+
+
+def list_my_orgs(user) -> list:
+    with db.session() as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT o.id, o.name, o.plan, m.role, "
+            "(SELECT COUNT(*) FROM org_members mm WHERE mm.org_id=o.id) AS miembros "
+            "FROM organizations o JOIN org_members m ON m.org_id=o.id "
+            "WHERE m.user_id=? ORDER BY o.id DESC", (user["id"],)).fetchall()]
+    return rows
+
+
+def invite_member(user, org_id: int, email: str) -> dict:
+    """El organizador (owner) invita a alguien por email al censo. Si ya tiene
+    cuenta, se añade directamente; si no, queda invitación pendiente + email."""
+    email = (email or "").strip().lower()
+    if not email:
+        raise SferaError(400, "Falta el email a invitar")
+    now = db.now()
+    with db.session() as conn:
+        if _org_role(conn, org_id, user["id"]) != "owner":
+            raise SferaError(403, "Solo el organizador puede invitar")
+        org = conn.execute("SELECT name FROM organizations WHERE id=?", (org_id,)).fetchone()
+        if not org:
+            raise SferaError(404, "Organización inexistente")
+        u = conn.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
+        if u:
+            try:
+                conn.execute("INSERT INTO org_members(org_id,user_id,role,created) VALUES(?,?,'member',?)",
+                             (org_id, dict(u)["id"], now))
+                _notify(conn, dict(u)["id"], "org_invite", None,
+                        f"Te han añadido a la organización «{dict(org)['name']}» en Sfera Civitas.")
+            except db.INTEGRITY_ERRORS:
+                pass
+            conn.commit()
+            _send_email(email, f"[Sfera Civitas] Te han añadido a «{dict(org)['name']}»",
+                        f"Ya formas parte de la organización «{dict(org)['name']}» en Sfera Civitas. Entra en {APP_URL} para participar en sus asuntos privados.")
+            return {"ok": True, "status": "added"}
+        token = secrets.token_urlsafe(16)
+        conn.execute("INSERT INTO org_invites(org_id,email,token,used,created) VALUES(?,?,?,0,?)",
+                     (org_id, email, token, now))
+        conn.commit()
+    link = f"{APP_URL}/#invitacion={token}"
+    _send_email(email, f"[Sfera Civitas] Invitación a «{dict(org)['name']}»",
+                f"Te invitan a la organización «{dict(org)['name']}» en Sfera Civitas.\n"
+                f"Regístrate con este email y acepta la invitación aquí:\n{link}")
+    out = {"ok": True, "status": "invited"}
+    if not _mail_configured():
+        out["token_piloto"] = token  # sin correo aún: se muestra el enlace en la app
+    return out
+
+
+def accept_invite(user, token: str) -> dict:
+    now = db.now()
+    with db.session() as conn:
+        inv = conn.execute("SELECT * FROM org_invites WHERE token=? AND used=0", (token,)).fetchone()
+        if not inv:
+            raise SferaError(404, "Invitación no válida o ya usada")
+        inv = dict(inv)
+        try:
+            conn.execute("INSERT INTO org_members(org_id,user_id,role,created) VALUES(?,?,'member',?)",
+                         (inv["org_id"], user["id"], now))
+        except db.INTEGRITY_ERRORS:
+            pass
+        conn.execute("UPDATE org_invites SET used=1 WHERE id=?", (inv["id"],))
+        conn.commit()
+    return {"ok": True, "org_id": inv["org_id"]}
+
+
+def list_org_members(user, org_id: int) -> list:
+    with db.session() as conn:
+        if not _is_org_member(conn, org_id, user["id"]):
+            raise SferaError(403, "No perteneces a esta organización")
+        rows = [dict(r) for r in conn.execute(
+            "SELECT u.email AS email, m.role AS role FROM org_members m JOIN users u ON u.id=m.user_id "
+            "WHERE m.org_id=? ORDER BY m.role DESC, u.email", (org_id,)).fetchall()]
+    return rows
+
+
+def list_org_debates(user, org_id: int) -> list:
+    with db.session() as conn:
+        if not _is_org_member(conn, org_id, user["id"]):
+            raise SferaError(403, "No perteneces a esta organización")
+        rows = [dict(r) for r in conn.execute(
+            "SELECT d.*, "
+            "(SELECT COUNT(*) FROM arguments a WHERE a.debate_id=d.id) + "
+            "(SELECT COUNT(*) FROM proposals p WHERE p.debate_id=d.id) AS aportaciones "
+            "FROM debates d WHERE d.org_id=? AND COALESCE(d.hidden,0)=0 ORDER BY d.id DESC", (org_id,)).fetchall()]
+    return rows
+
+
+# ── PAGO POR USO (parte privada) ──────────────────────────────────────────────
+def _billing_configured() -> bool:
+    if BILLING_PROVIDER == "lemonsqueezy":
+        return bool(LS_CHECKOUT_URL or (LS_API_KEY and LS_STORE_ID and LS_VARIANT_ID))
+    if BILLING_PROVIDER == "paddle":
+        return bool(os.environ.get("SFERA_PADDLE_CHECKOUT_URL"))
+    if BILLING_PROVIDER == "polar":
+        return bool(os.environ.get("SFERA_POLAR_CHECKOUT_URL"))
+    return False
+
+
+def billing_config() -> dict:
+    """Info PÚBLICA del cobro por uso (para la app / reglas). Sin secretos."""
+    return {
+        "provider": BILLING_PROVIDER,
+        "enabled": _billing_configured(),
+        "price_cents": PRICE_CENTS,
+        "currency": PRICE_CURRENCY,
+        "unit": PRICE_UNIT,
+        "units_per_purchase": PRICE_UNITS_PER_PURCHASE,
+        "price_label": (f"{PRICE_CENTS/100:.2f} {PRICE_CURRENCY} / {PRICE_UNIT}" if PRICE_CENTS > 0 else "por definir"),
+        "criterion": BILLING_CRITERION,
+        "merchant_of_record": True,
+    }
+
+
+def create_checkout(user, org_id: int) -> dict:
+    """Genera un enlace de pago para la organización (solo el organizador).
+    Adjunta org_id como dato personalizado para casarlo en el webhook."""
+    with db.session() as conn:
+        if _org_role(conn, org_id, user["id"]) != "owner":
+            raise SferaError(403, "Solo el organizador puede gestionar el pago")
+        org = conn.execute("SELECT id,name FROM organizations WHERE id=?", (org_id,)).fetchone()
+        if not org:
+            raise SferaError(404, "Organización inexistente")
+    if not _billing_configured():
+        raise SferaError(503, "El pago por uso aún no está activado (falta configurar el proveedor).")
+    if BILLING_PROVIDER == "lemonsqueezy":
+        # (a) API: crea un checkout con custom data org_id
+        if LS_API_KEY and LS_STORE_ID and LS_VARIANT_ID:
+            import urllib.request as _rq
+            payload = {"data": {"type": "checkouts",
+                "attributes": {"checkout_data": {"custom": {"org_id": str(org_id)},
+                                                 "email": user.get("email") or None}},
+                "relationships": {
+                    "store": {"data": {"type": "stores", "id": str(LS_STORE_ID)}},
+                    "variant": {"data": {"type": "variants", "id": str(LS_VARIANT_ID)}}}}}
+            try:
+                req = _rq.Request("https://api.lemonsqueezy.com/v1/checkouts",
+                    data=json.dumps(payload).encode(),
+                    headers={"Authorization": "Bearer " + LS_API_KEY,
+                             "Content-Type": "application/vnd.api+json",
+                             "Accept": "application/vnd.api+json"}, method="POST")
+                with _rq.urlopen(req, timeout=15) as r:
+                    j = json.loads(r.read().decode())
+                url = j.get("data", {}).get("attributes", {}).get("url")
+                if url:
+                    return {"url": url}
+            except Exception as e:
+                raise SferaError(502, "No se pudo crear el checkout: " + str(e))
+        # (b) Enlace alojado: adjunta org_id por query string
+        if LS_CHECKOUT_URL:
+            sep = "&" if "?" in LS_CHECKOUT_URL else "?"
+            return {"url": f"{LS_CHECKOUT_URL}{sep}checkout[custom][org_id]={org_id}"}
+    if BILLING_PROVIDER == "paddle" and os.environ.get("SFERA_PADDLE_CHECKOUT_URL"):
+        base = os.environ["SFERA_PADDLE_CHECKOUT_URL"]; sep = "&" if "?" in base else "?"
+        return {"url": f"{base}{sep}custom_org_id={org_id}"}
+    if BILLING_PROVIDER == "polar" and os.environ.get("SFERA_POLAR_CHECKOUT_URL"):
+        base = os.environ["SFERA_POLAR_CHECKOUT_URL"]; sep = "&" if "?" in base else "?"
+        return {"url": f"{base}{sep}metadata[org_id]={org_id}"}
+    raise SferaError(503, "El pago por uso aún no está activado.")
+
+
+def get_org_billing(user, org_id: int) -> dict:
+    with db.session() as conn:
+        if not _is_org_member(conn, org_id, user["id"]):
+            raise SferaError(403, "No perteneces a esta organización")
+        o = conn.execute("SELECT plan, COALESCE(paid_units,0) AS paid_units, active_until "
+                         "FROM organizations WHERE id=?", (org_id,)).fetchone()
+        used = conn.execute("SELECT COUNT(*) AS n FROM debates WHERE org_id=? AND COALESCE(hidden,0)=0", (org_id,)).fetchone()
+    o = dict(o) if o else {"plan": "trial", "paid_units": 0, "active_until": None}
+    o["used_units"] = dict(used)["n"] if used else 0
+    o["config"] = billing_config()
+    o["role"] = _org_role_cached(org_id, user["id"])
+    return o
+
+
+def _org_role_cached(org_id, uid):
+    with db.session() as conn:
+        return _org_role(conn, org_id, uid)
+
+
+def _verify_ls_signature(raw: bytes, signature: str) -> bool:
+    if not LS_WEBHOOK_SECRET:
+        return False
+    digest = hmac.new(LS_WEBHOOK_SECRET.encode(), raw, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(digest, (signature or "").strip())
+
+
+def handle_webhook(provider: str, headers: dict, raw: bytes) -> dict:
+    """Recibe y VERIFICA (firma) un evento de pago; registra el pago de forma
+    idempotente y acredita unidades de uso a la organización. Nunca confía en el
+    cuerpo sin verificar la firma del proveedor."""
+    provider = (provider or BILLING_PROVIDER).lower()
+    hdr = {k.lower(): v for k, v in (headers or {}).items()}
+    if provider == "lemonsqueezy":
+        if not _verify_ls_signature(raw, hdr.get("x-signature", "")):
+            raise SferaError(401, "Firma de webhook no válida")
+        try:
+            body = json.loads(raw.decode())
+        except Exception:
+            raise SferaError(400, "Cuerpo no válido")
+        meta = body.get("meta", {})
+        event = meta.get("event_name", "")
+        data = body.get("data", {})
+        attrs = data.get("attributes", {})
+        ext_id = str(data.get("id") or attrs.get("identifier") or "")
+        status = attrs.get("status", "")
+        total = int(attrs.get("total", 0) or 0)
+        currency = attrs.get("currency", PRICE_CURRENCY)
+        email = attrs.get("user_email") or attrs.get("email")
+        custom = (meta.get("custom_data") or {})
+        org_id = custom.get("org_id")
+        try:
+            org_id = int(org_id) if org_id is not None else None
+        except Exception:
+            org_id = None
+        paid = event in ("order_created", "subscription_payment_success") and status in ("paid", "active", "")
+        if not paid:
+            return {"ok": True, "ignored": event or status}
+        units = PRICE_UNITS_PER_PURCHASE if PRICE_UNITS_PER_PURCHASE > 0 else 1
+        return _record_payment(provider, ext_id, "paid", total, currency, units, email, org_id, raw)
+    # Paddle / Polar: verificación específica (dejada lista para claves reales)
+    if provider == "paddle":
+        if not _verify_paddle_signature(raw, hdr.get("paddle-signature", "")):
+            raise SferaError(401, "Firma de webhook no válida")
+        try:
+            body = json.loads(raw.decode())
+        except Exception:
+            raise SferaError(400, "Cuerpo no válido")
+        d = body.get("data", {})
+        ext_id = str(d.get("id") or "")
+        cd = d.get("custom_data") or {}
+        org_id = cd.get("org_id")
+        try: org_id = int(org_id) if org_id is not None else None
+        except Exception: org_id = None
+        if body.get("event_type") not in ("transaction.completed", "transaction.paid"):
+            return {"ok": True, "ignored": body.get("event_type")}
+        return _record_payment(provider, ext_id, "paid", 0, PRICE_CURRENCY,
+                               max(1, PRICE_UNITS_PER_PURCHASE), None, org_id, raw)
+    if provider == "polar":
+        if POLAR_WEBHOOK_SECRET and not hmac.compare_digest(
+                hmac.new(POLAR_WEBHOOK_SECRET.encode(), raw, hashlib.sha256).hexdigest(),
+                (hdr.get("webhook-signature", "") or "").strip()):
+            raise SferaError(401, "Firma de webhook no válida")
+        try:
+            body = json.loads(raw.decode())
+        except Exception:
+            raise SferaError(400, "Cuerpo no válido")
+        d = body.get("data", {})
+        ext_id = str(d.get("id") or "")
+        md = d.get("metadata") or {}
+        org_id = md.get("org_id")
+        try: org_id = int(org_id) if org_id is not None else None
+        except Exception: org_id = None
+        if not str(body.get("type", "")).startswith("order."):
+            return {"ok": True, "ignored": body.get("type")}
+        return _record_payment(provider, ext_id, "paid", 0, PRICE_CURRENCY,
+                               max(1, PRICE_UNITS_PER_PURCHASE), None, org_id, raw)
+    raise SferaError(400, "Proveedor de pago desconocido")
+
+
+def _verify_paddle_signature(raw: bytes, header: str) -> bool:
+    """Paddle Billing: cabecera 'ts=<unix>;h1=<hmac_sha256(ts:body)>'."""
+    if not PADDLE_WEBHOOK_SECRET or not header:
+        return False
+    parts = dict(p.split("=", 1) for p in header.split(";") if "=" in p)
+    ts, h1 = parts.get("ts"), parts.get("h1")
+    if not ts or not h1:
+        return False
+    signed = f"{ts}:".encode() + raw
+    calc = hmac.new(PADDLE_WEBHOOK_SECRET.encode(), signed, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(calc, h1)
+
+
+def _record_payment(provider, ext_id, status, amount_cents, currency, units, email, org_id, raw) -> dict:
+    """Inserta el pago (idempotente por (provider, external_id)) y acredita unidades."""
+    if not ext_id:
+        raise SferaError(400, "Pago sin identificador")
+    with db.session() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO payments(org_id,provider,external_id,status,amount_cents,currency,units,email,raw,created) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (org_id, provider, ext_id, status, amount_cents, currency, units, email,
+                 raw.decode("utf-8", "replace")[:10000], db.now()))
+        except db.INTEGRITY_ERRORS:
+            conn._raw.rollback() if hasattr(conn, "_raw") else None
+            return {"ok": True, "duplicate": True}  # ya procesado (reintento del proveedor)
+        if org_id:
+            conn.execute("UPDATE organizations SET paid_units=COALESCE(paid_units,0)+?, plan='active' WHERE id=?",
+                         (units, org_id))
+            owner = conn.execute("SELECT owner_id FROM organizations WHERE id=?", (org_id,)).fetchone()
+            if owner:
+                _notify(conn, dict(owner)["owner_id"], "pago", None,
+                        f"Pago recibido: +{units} unidad(es) de uso para tu espacio privado. ¡Gracias!")
+        conn.commit()
+    return {"ok": True, "credited_units": units, "org_id": org_id}
+
+
+def create_debate(title, body, materia, administracion, user, nivel="", territorio="", org_id=None) -> dict:
+    """Convocar un asunto.
+    · PÚBLICO (org_id None): DOCTRINA — cualquier registrado propone; nace en fase
+      'convocar' y tiene CONV_DIAS para reunir el quórum en alguna vía (el proponente
+      apoya en la suya).
+    · PRIVADO (org_id): asunto de una organización (colectivo de pago). Solo un
+      miembro puede convocarlo; NO lleva quórum (arranca directamente en 'deliberar')
+      y es visible solo para el censo de la organización."""
     if not (title or "").strip():
         raise SferaError(400, "El asunto necesita un título")
     now = db.now()
-    via = _user_via(user)
     with db.session() as conn:
+        if org_id:
+            if not _is_org_member(conn, org_id, user["id"]):
+                raise SferaError(403, "No perteneces a esta organización")
+            cur = conn.execute(
+                "INSERT INTO debates(title,body,materia,administracion,nivel,territorio,"
+                "phase,visibility,org_id,created_by,conv_status,created) "
+                "VALUES(?,?,?,?,?,?,'deliberar','private',?,?,'avanzado',?)",
+                (title, body, materia, administracion, (nivel or None), (territorio or None),
+                 org_id, user["id"], now), returning=True)
+            conn.commit()
+            return {"debate_id": cur.lastrowid, "phase": "deliberar", "visibility": "private", "org_id": org_id}
+        # Público: convocatoria con doble vía
+        via = _user_via(user)
         cur = conn.execute(
             "INSERT INTO debates(title,body,materia,administracion,nivel,territorio,"
             "phase,visibility,created_by,conv_status,conv_deadline,created) "
@@ -409,7 +827,6 @@ def create_debate(title, body, materia, administracion, user, nivel="", territor
             (title, body, materia, administracion, (nivel or None), (territorio or None),
              user["id"], now + CONV_DIAS * 86400, now), returning=True)
         did = cur.lastrowid
-        # El proponente apoya su propio asunto (en su vía).
         try:
             conn.execute("INSERT INTO supports(debate_id,user_id,via,created) VALUES(?,?,?,?)",
                          (did, user["id"], via, now))
@@ -451,17 +868,21 @@ def list_debates() -> list:
             "SELECT d.*, "
             "(SELECT COUNT(*) FROM arguments a WHERE a.debate_id=d.id) + "
             "(SELECT COUNT(*) FROM proposals p WHERE p.debate_id=d.id) AS aportaciones "
-            "FROM debates d WHERE COALESCE(d.hidden,0)=0 ORDER BY d.id DESC").fetchall()]
+            "FROM debates d WHERE COALESCE(d.hidden,0)=0 AND d.org_id IS NULL ORDER BY d.id DESC").fetchall()]
         for r in rows:
             r.update(_conv_apply(conn, r))   # estado de convocatoria + avance/caducidad perezosos
     return rows
 
 
-def get_debate(did: int) -> dict:
+def get_debate(did: int, user=None) -> dict:
     with db.session() as conn:
         d = conn.execute("SELECT * FROM debates WHERE id=?", (did,)).fetchone()
         if not d:
             raise SferaError(404, "No existe")
+        # Asuntos PRIVADOS: solo visibles para el censo de su organización.
+        oid = d["org_id"] if "org_id" in d.keys() else None
+        if oid and not (user and _is_org_member(conn, oid, user["id"])):
+            raise SferaError(403, "Asunto privado: solo para miembros de la organización")
         args = [dict(r) for r in conn.execute("SELECT * FROM arguments WHERE debate_id=? ORDER BY id", (did,)).fetchall()]
         props = [dict(r) for r in conn.execute("SELECT * FROM proposals WHERE debate_id=? ORDER BY id", (did,)).fetchall()]
         elec = conn.execute("SELECT id,question,options_json,status FROM elections WHERE debate_id=? ORDER BY id DESC", (did,)).fetchone()
