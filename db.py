@@ -168,6 +168,30 @@ CREATE TABLE IF NOT EXISTS debates (
   phase TEXT DEFAULT 'convocar',
   cierre {REAL},                        -- fecha límite de la votación (epoch); NULL si no está en votación
   hidden INTEGER DEFAULT 0,             -- 1 = archivado (no se lista): p.ej. datos de prueba
+  visibility TEXT DEFAULT 'public',     -- 'public' (democracia directa) | 'private' (colectivo de pago)
+  created_by INTEGER,                   -- proponente (ciudadano que convoca)
+  conv_status TEXT DEFAULT 'recabando', -- CONVOCATORIA (fase 0): recabando | avanzado | caducado
+  conv_deadline {REAL},                 -- fecha límite para reunir el quórum (createdAt + 2 semanas)
+  qualified_track TEXT,                 -- vía que alcanzó el umbral: 'abierto' | 'verificado' | NULL
+  created {REAL}
+);
+-- CONVOCATORIA (Fase 0): apoyos por VÍA. Doctrina: doble vía que NO se fusiona.
+-- Un apoyo por persona y asunto; cuenta en la vía del registro del usuario (loa).
+CREATE TABLE IF NOT EXISTS supports (
+  debate_id INTEGER NOT NULL REFERENCES debates(id),
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  via TEXT NOT NULL,                    -- 'abierto' (email) | 'verificado' (certificado/Cl@ve/DNIe)
+  created {REAL},
+  PRIMARY KEY (debate_id, user_id)
+);
+-- AVISOS in-app: todo el proceso se informa dentro de la aplicación.
+CREATE TABLE IF NOT EXISTS notifications (
+  id {AUTOINC},
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  kind TEXT NOT NULL,                   -- prospera | caduca | experts_needed | ...
+  debate_id INTEGER,
+  text TEXT NOT NULL,
+  read INTEGER DEFAULT 0,
   created {REAL}
 );
 CREATE TABLE IF NOT EXISTS arguments (
@@ -324,6 +348,12 @@ def init_db():
         conn.execute("ALTER TABLE debates ADD COLUMN IF NOT EXISTS nivel TEXT")
         conn.execute("ALTER TABLE debates ADD COLUMN IF NOT EXISTS territorio TEXT")
         conn.execute("ALTER TABLE debates ADD COLUMN IF NOT EXISTS cierre DOUBLE PRECISION")
+        # Convocatoria / doble vía (doctrina): columnas nuevas en tablas preexistentes
+        conn.execute("ALTER TABLE debates ADD COLUMN IF NOT EXISTS visibility TEXT DEFAULT 'public'")
+        conn.execute("ALTER TABLE debates ADD COLUMN IF NOT EXISTS created_by INTEGER")
+        conn.execute("ALTER TABLE debates ADD COLUMN IF NOT EXISTS conv_status TEXT DEFAULT 'recabando'")
+        conn.execute("ALTER TABLE debates ADD COLUMN IF NOT EXISTS conv_deadline DOUBLE PRECISION")
+        conn.execute("ALTER TABLE debates ADD COLUMN IF NOT EXISTS qualified_track TEXT")
         conn.commit()
         try:  # unique del tablón en tablas preexistentes (idempotente)
             conn.execute("ALTER TABLE bulletin_board ADD CONSTRAINT uq_bb_seq UNIQUE (election_id, seq)")
@@ -357,6 +387,15 @@ def init_db():
         if "cierre" not in dcols:
             conn._raw.execute("ALTER TABLE debates ADD COLUMN cierre REAL")  # type: ignore[attr-defined]
             conn.commit()
+        # Convocatoria / doble vía (doctrina)
+        for col, ddl in (("visibility", "ALTER TABLE debates ADD COLUMN visibility TEXT DEFAULT 'public'"),
+                         ("created_by", "ALTER TABLE debates ADD COLUMN created_by INTEGER"),
+                         ("conv_status", "ALTER TABLE debates ADD COLUMN conv_status TEXT DEFAULT 'recabando'"),
+                         ("conv_deadline", "ALTER TABLE debates ADD COLUMN conv_deadline REAL"),
+                         ("qualified_track", "ALTER TABLE debates ADD COLUMN qualified_track TEXT")):
+            if col not in dcols:
+                conn._raw.execute(ddl)  # type: ignore[attr-defined]
+                conn.commit()
     seed_and_clean(conn)
     conn.close()
 

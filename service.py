@@ -37,6 +37,165 @@ import crypto_zk as zk
 PHASES = ["convocar", "deliberar", "proponer", "votar", "publicar"]
 VOTACION_DIAS = 14  # ventana estándar de una votación (días) para fijar la fecha de cierre
 VIAS = ("open", "verified")
+
+# ── CONVOCATORIA (Fase 0) — DOCTRINA: doble vía que NUNCA se fusiona ───────────
+# Un asunto recién convocado tiene CONV_DIAS para reunir el quórum. Avanza si
+# CUALQUIERA de las dos vías alcanza su umbral; si vence el plazo sin lograrlo,
+# caduca. Umbrales ajustables por entorno (Render) sin tocar código.
+CONV_DIAS = int(os.environ.get("SFERA_CONV_DIAS", "14"))            # plazo de convocatoria (días)
+CONV_QUORUM = int(os.environ.get("SFERA_CONV_QUORUM", "100"))       # vía ABIERTA (email): baja garantía, umbral alto
+CONV_QUORUM_VERIF = int(os.environ.get("SFERA_CONV_QUORUM_VERIF", "25"))  # vía VERIFICADA (certificado): alta garantía, umbral bajo
+
+
+def _user_via(user: dict) -> str:
+    """Vía de apoyo/voto según el nivel de identidad del registro."""
+    return "verificado" if (user.get("loa") == "verified") else "abierto"
+
+
+def _conv_counts(conn, did) -> tuple:
+    ab = conn.execute("SELECT COUNT(*) AS n FROM supports WHERE debate_id=? AND via='abierto'", (did,)).fetchone()
+    ve = conn.execute("SELECT COUNT(*) AS n FROM supports WHERE debate_id=? AND via='verificado'", (did,)).fetchone()
+    return (int(dict(ab)["n"]) if ab else 0, int(dict(ve)["n"]) if ve else 0)
+
+
+def _conv_apply(conn, d, persist=True) -> dict:
+    """Calcula el estado de convocatoria de un asunto y, si procede, lo hace
+    avanzar (a 'deliberar') o caducar. Devuelve los campos de convocatoria
+    para adjuntar al asunto. Idempotente."""
+    did = d["id"]
+    ab, ve = _conv_counts(conn, did)
+    phase = d["phase"]
+    conv_status = d["conv_status"] if "conv_status" in d.keys() else "recabando"
+    deadline = d["conv_deadline"] if "conv_deadline" in d.keys() else None
+    qual = d["qualified_track"] if "qualified_track" in d.keys() else None
+    if phase == "convocar" and conv_status == "recabando":
+        if ab >= CONV_QUORUM or ve >= CONV_QUORUM_VERIF:
+            qual = "verificado" if ve >= CONV_QUORUM_VERIF else "abierto"
+            conv_status = "avanzado"; phase = "deliberar"
+            if persist:
+                conn.execute("UPDATE debates SET phase='deliberar', conv_status='avanzado', qualified_track=? WHERE id=?", (qual, did))
+                conn.commit()
+                try: _on_prospera(conn, d, qual)   # avisos in-app + email a admins (asignar expertos)
+                except Exception: pass
+        elif deadline is not None and db.now() > float(deadline):
+            conv_status = "caducado"
+            if persist:
+                conn.execute("UPDATE debates SET conv_status='caducado' WHERE id=?", (did,))
+                conn.commit()
+                try: _on_caduca(conn, d)
+                except Exception: pass
+    dias = None
+    if deadline is not None:
+        dias = max(0, int((float(deadline) - db.now()) // 86400) + (1 if (float(deadline) - db.now()) % 86400 else 0))
+    return {
+        "phase": phase, "conv_status": conv_status, "qualified_track": qual,
+        "apoyos_abierto": ab, "apoyos_verificado": ve,
+        "quorum_abierto": CONV_QUORUM, "quorum_verificado": CONV_QUORUM_VERIF,
+        "conv_deadline": deadline, "conv_dias_restantes": dias,
+    }
+
+
+def get_config() -> dict:
+    """Reglas públicas y publicadas del proceso (para 'Cómo funciona / Reglas')."""
+    return {
+        "phases": PHASES,
+        "fase_dias": VOTACION_DIAS,
+        "conv_dias": CONV_DIAS,
+        "conv_quorum_abierto": CONV_QUORUM,
+        "conv_quorum_verificado": CONV_QUORUM_VERIF,
+    }
+
+
+# ── AVISOS in-app + correo (todo el proceso se informa en la app) ─────────────
+APP_URL = os.environ.get("SFERA_APP_URL", "https://app.sferacivitas.org")
+
+
+def _send_email(to: str, subject: str, body: str) -> bool:
+    host = os.environ.get("SFERA_SMTP_HOST")
+    if not host or not to:
+        return False
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = os.environ.get("SFERA_SMTP_FROM", "no-reply@sferacivitas.org")
+        msg["To"] = to
+        msg.set_content(body)
+        port = int(os.environ.get("SFERA_SMTP_PORT", "587"))
+        with smtplib.SMTP(host, port, timeout=10) as srv:
+            srv.starttls()
+            user = os.environ.get("SFERA_SMTP_USER")
+            if user:
+                srv.login(user, os.environ.get("SFERA_SMTP_PASSWORD", ""))
+            srv.send_message(msg)
+        return True
+    except Exception:
+        return False
+
+
+def _notify(conn, user_id, kind, debate_id, text):
+    if not user_id:
+        return
+    conn.execute("INSERT INTO notifications(user_id,kind,debate_id,text,read,created) VALUES(?,?,?,?,0,?)",
+                 (user_id, kind, debate_id, text, db.now()))
+
+
+def _admin_recipients(conn, d) -> list:
+    """Super Admins + admins del ámbito del asunto (a quienes designe el Super Admin).
+    Devuelve [(user_id, email)] sin duplicados."""
+    out = {}
+    for r in conn.execute("SELECT id,email FROM users WHERE is_admin=1").fetchall():
+        rr = dict(r); out[rr["id"]] = rr["email"]
+    adm = (d["administracion"] or ""); mat = (d["materia"] or "")
+    rows = conn.execute(
+        "SELECT u.id AS id, u.email AS email, g.scope_type AS st, g.scope_value AS sv "
+        "FROM grants g JOIN users u ON u.id=g.user_id WHERE g.role='admin'").fetchall()
+    for r in rows:
+        rr = dict(r)
+        if rr["st"] == "global" or (rr["st"] == "aapp" and rr["sv"] == adm) or (rr["st"] == "materia" and rr["sv"] == mat):
+            out[rr["id"]] = rr["email"]
+    return list(out.items())
+
+
+def _on_prospera(conn, d, qual):
+    """Un asunto reúne apoyo suficiente y pasa a Deliberación: se informa al
+    proponente y se avisa (in-app + email) al Super Admin y a los admins del
+    ámbito para que ASIGNEN EXPERTOS."""
+    did = d["id"]; title = d["title"]
+    via_txt = "voto verificado" if qual == "verificado" else "pulso abierto"
+    _notify(conn, d["created_by"], "prospera", did,
+            f"Tu asunto «{title}» ha reunido apoyo suficiente ({via_txt}) y pasa a Deliberación.")
+    subject = f"[Sfera Civitas] Asigna expertos: «{title}»"
+    link = f"{APP_URL}/#asunto-{did}"
+    body = (f"El asunto «{title}» ha alcanzado el quórum ({via_txt}) y pasa a la fase de Deliberación.\n\n"
+            f"Como administrador, entra a asignar los expertos que redactarán los documentos oficiales:\n{link}\n\n"
+            f"Materia: {d['materia'] or '—'} · Administración: {d['administracion'] or '—'}\n")
+    for uid, email in _admin_recipients(conn, d):
+        _notify(conn, uid, "experts_needed", did,
+                f"El asunto «{title}» pasa a Deliberación. Asigna expertos.")
+        _send_email(email, subject, body)
+    conn.commit()
+
+
+def _on_caduca(conn, d):
+    did = d["id"]; title = d["title"]
+    _notify(conn, d["created_by"], "caduca", did,
+            f"Tu asunto «{title}» no reunió el apoyo suficiente en el plazo y ha caducado.")
+    conn.commit()
+
+
+def list_notifications(user) -> dict:
+    with db.session() as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT id,kind,debate_id,text,read,created FROM notifications "
+            "WHERE user_id=? ORDER BY id DESC LIMIT 50", (user["id"],)).fetchall()]
+    return {"items": rows, "unread": sum(1 for r in rows if not r["read"])}
+
+
+def mark_notifications_read(user) -> dict:
+    with db.session() as conn:
+        conn.execute("UPDATE notifications SET read=1 WHERE user_id=? AND read=0", (user["id"],))
+        conn.commit()
+    return {"ok": True}
 UMBRAL = {"open": 100, "verified": 25}
 
 # ── Config de seguridad (entorno) ─────────────────────────────────────────────
@@ -163,8 +322,11 @@ def register(email: str, password: str) -> dict:
         uid = cur.lastrowid
     sent = _send_2fa_email(email, code)
     out = {"user_id": uid, "email_enviado": sent}
-    if SFERA_DEV:
-        out["twofa_code_DEV"] = code  # solo en desarrollo
+    # COHERENCIA: si el correo se envía de verdad, NO se revela el código (verificación real).
+    # Si aún no hay correo configurado (modo piloto), se entrega el código en la app,
+    # etiquetado con honestidad, para que el proceso de verificación funcione igualmente.
+    if not sent:
+        out["codigo_piloto"] = code
     return out
 
 
@@ -231,17 +393,54 @@ def change_password(uid, old_password: str, new_password: str) -> dict:
 
 # ── Debates / fases ──────────────────────────────────────────────────────────
 def create_debate(title, body, materia, administracion, user, nivel="", territorio="") -> dict:
-    import roles
+    """Convocar un asunto (Fase 0). DOCTRINA: cualquier ciudadano registrado puede
+    proponer un asunto en el ámbito PÚBLICO; nace en fase 'convocar' y tiene
+    CONV_DIAS para reunir el quórum en alguna de las dos vías. El proponente
+    apoya automáticamente en su vía."""
+    if not (title or "").strip():
+        raise SferaError(400, "El asunto necesita un título")
+    now = db.now()
+    via = _user_via(user)
     with db.session() as conn:
-        if not roles.can_admin_new(conn, user, administracion, materia):
-            raise SferaError(403, "No tienes permiso para convocar asuntos en ese ámbito (AAPP/materia)")
         cur = conn.execute(
-            "INSERT INTO debates(title,body,materia,administracion,nivel,territorio,phase,created) "
-            "VALUES(?,?,?,?,?,?,'deliberar',?)",
-            (title, body, materia, administracion, (nivel or None), (territorio or None), db.now()), returning=True)
-        conn.commit()
+            "INSERT INTO debates(title,body,materia,administracion,nivel,territorio,"
+            "phase,visibility,created_by,conv_status,conv_deadline,created) "
+            "VALUES(?,?,?,?,?,?,'convocar','public',?,'recabando',?,?)",
+            (title, body, materia, administracion, (nivel or None), (territorio or None),
+             user["id"], now + CONV_DIAS * 86400, now), returning=True)
         did = cur.lastrowid
-    return {"debate_id": did, "phase": "deliberar"}
+        # El proponente apoya su propio asunto (en su vía).
+        try:
+            conn.execute("INSERT INTO supports(debate_id,user_id,via,created) VALUES(?,?,?,?)",
+                         (did, user["id"], via, now))
+        except db.INTEGRITY_ERRORS:
+            pass
+        conn.commit()
+        d = conn.execute("SELECT * FROM debates WHERE id=?", (did,)).fetchone()
+        conv = _conv_apply(conn, d)
+    return {"debate_id": did, **conv}
+
+
+def support_debate(did: int, user) -> dict:
+    """Apoyar un asunto en fase de convocatoria. Un apoyo por persona y asunto;
+    cuenta en la vía del registro del usuario. Si con este apoyo se alcanza el
+    umbral de alguna vía, el asunto avanza a Deliberar."""
+    via = _user_via(user)
+    now = db.now()
+    with db.session() as conn:
+        d = conn.execute("SELECT * FROM debates WHERE id=?", (did,)).fetchone()
+        if not d:
+            raise SferaError(404, "No existe")
+        if d["phase"] != "convocar":
+            raise SferaError(409, "Este asunto ya no está en fase de convocatoria")
+        already = conn.execute("SELECT 1 FROM supports WHERE debate_id=? AND user_id=?", (did, user["id"])).fetchone()
+        if not already:
+            conn.execute("INSERT INTO supports(debate_id,user_id,via,created) VALUES(?,?,?,?)",
+                         (did, user["id"], via, now))
+            conn.commit()
+            d = conn.execute("SELECT * FROM debates WHERE id=?", (did,)).fetchone()
+        conv = _conv_apply(conn, d)
+    return {"already": bool(already), "via": via, **conv}
 
 
 def list_debates() -> list:
@@ -253,6 +452,8 @@ def list_debates() -> list:
             "(SELECT COUNT(*) FROM arguments a WHERE a.debate_id=d.id) + "
             "(SELECT COUNT(*) FROM proposals p WHERE p.debate_id=d.id) AS aportaciones "
             "FROM debates d WHERE COALESCE(d.hidden,0)=0 ORDER BY d.id DESC").fetchall()]
+        for r in rows:
+            r.update(_conv_apply(conn, r))   # estado de convocatoria + avance/caducidad perezosos
     return rows
 
 
@@ -265,6 +466,7 @@ def get_debate(did: int) -> dict:
         props = [dict(r) for r in conn.execute("SELECT * FROM proposals WHERE debate_id=? ORDER BY id", (did,)).fetchall()]
         elec = conn.execute("SELECT id,question,options_json,status FROM elections WHERE debate_id=? ORDER BY id DESC", (did,)).fetchone()
         out = dict(d)
+        out.update(_conv_apply(conn, d))   # estado de convocatoria (doble vía) + avance/caducidad
     out["arguments"] = args
     out["proposals"] = props
     out["election"] = dict(elec) if elec else None
