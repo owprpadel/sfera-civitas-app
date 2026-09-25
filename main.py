@@ -190,6 +190,18 @@ def support_run(x_sfera_cron: Optional[str] = Header(None),
 @app.get("/api/support/status")
 def support_status():
     return {"configured": sup.configured(), "support_addr": sup.SUPPORT_ADDR}
+@app.post("/api/support/ingest")
+async def support_ingest(request: Request, x_sfera_cron: Optional[str] = Header(None),
+                         authorization: Optional[str] = Header(None)):
+    cron = os.environ.get("SFERA_CRON_KEY")
+    if not (cron and x_sfera_cron == cron):
+        admin_user(current_user(authorization))
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    msgs = body.get("messages") if isinstance(body, dict) else body
+    return sup.ingest_messages(msgs or [])
 @app.post("/api/cert/challenge")
 def cert_challenge(i: CertChallengeIn): return _wrap_cert(cs.start_challenge, i.email)
 @app.post("/api/cert/verify")

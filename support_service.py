@@ -158,43 +158,7 @@ def run_support_cycle(limit: int = 50) -> dict:
             sender = _addr(_dec(msg.get("From")))
             subject = _dec(msg.get("Subject"))
             body = _body_text(msg)[:8000]
-            with db.session() as conn:
-                if _ticket_exists(conn, msg_id):
-                    continue
-                summary["nuevos"] += 1
-                now = db.now()
-                cur = conn.execute(
-                    "INSERT INTO support_tickets(msg_uid,from_email,subject,body,status,created,updated) "
-                    "VALUES(?,?,?,?, 'nuevo', ?, ?)", (msg_id, sender, subject, body, now, now), returning=True)
-                tid = cur.lastrowid
-                conn.commit()
-            # 1) acuse de recibo
-            if sender:
-                if service._send_email(sender, ACUSE_SUBJECT, ACUSE_BODY):
-                    summary["acuses"] += 1
-                    with db.session() as conn:
-                        conn.execute("UPDATE support_tickets SET status='acuse', updated=? WHERE id=?", (db.now(), tid)); conn.commit()
-            # 2) resolución (FAQ) o escalado
-            faq = _match_faq(subject, body)
-            if faq and sender:
-                title, text = faq
-                ok = service._send_email(sender, f"Re: {subject or title} · Sfera Civitas", text + _SIGN)
-                if ok:
-                    summary["resueltos"] += 1
-                    summary["detalle"].append({"ticket": tid, "de": sender, "asunto": subject, "accion": "resuelto", "faq": title})
-                    with db.session() as conn:
-                        conn.execute("UPDATE support_tickets SET status='resuelto', resolution=?, updated=? WHERE id=?",
-                                     (title, db.now(), tid)); conn.commit()
-            else:
-                # escalar a hola@ (persona) con el contenido íntegro
-                esc = (f"Nuevo mensaje de soporte que requiere respuesta humana.\n\n"
-                       f"De: {sender}\nAsunto: {subject}\n\n{body}\n\n"
-                       f"(Ticket #{tid}. Responde directamente al remitente.)")
-                service._send_email(ESCALATE_TO, f"[SOPORTE] {subject or '(sin asunto)'}", esc)
-                summary["escalados"] += 1
-                summary["detalle"].append({"ticket": tid, "de": sender, "asunto": subject, "accion": "escalado"})
-                with db.session() as conn:
-                    conn.execute("UPDATE support_tickets SET status='escalado', updated=? WHERE id=?", (db.now(), tid)); conn.commit()
+            _handle_message(msg_id, sender, subject, body, summary)
             # marcar leído
             try:
                 M.uid("STORE", uid, "+FLAGS", "(\\Seen)")
@@ -205,5 +169,61 @@ def run_support_cycle(limit: int = 50) -> dict:
             M.logout()
         except Exception:
             pass
+    summary["ok"] = True
+    return summary
+
+
+def _handle_message(ext_id: str, sender: str, subject: str, body: str, summary: dict) -> bool:
+    """Procesa UN mensaje de soporte: ticket idempotente + acuse + resolución FAQ o
+    escalado a hola@. Compartido por la vía IMAP y la vía de ingesta (navegador)."""
+    sender = _addr(sender) or (sender or "").strip().lower()
+    subject = subject or ""
+    body = (body or "")[:8000]
+    ext_id = (ext_id or "").strip() or ("subj:" + subject + "|" + sender)
+    with db.session() as conn:
+        if _ticket_exists(conn, ext_id):
+            return False
+        summary["nuevos"] = summary.get("nuevos", 0) + 1
+        now = db.now()
+        cur = conn.execute(
+            "INSERT INTO support_tickets(msg_uid,from_email,subject,body,status,created,updated) "
+            "VALUES(?,?,?,?, 'nuevo', ?, ?)", (ext_id, sender, subject, body, now, now), returning=True)
+        tid = cur.lastrowid
+        conn.commit()
+    if sender and service._send_email(sender, ACUSE_SUBJECT, ACUSE_BODY):
+        summary["acuses"] = summary.get("acuses", 0) + 1
+        with db.session() as conn:
+            conn.execute("UPDATE support_tickets SET status='acuse', updated=? WHERE id=?", (db.now(), tid)); conn.commit()
+    faq = _match_faq(subject, body)
+    if faq and sender:
+        title, text = faq
+        if service._send_email(sender, f"Re: {subject or title} · Sfera Civitas", text + _SIGN):
+            summary["resueltos"] = summary.get("resueltos", 0) + 1
+            summary.setdefault("detalle", []).append({"ticket": tid, "de": sender, "asunto": subject, "accion": "resuelto", "faq": title})
+            with db.session() as conn:
+                conn.execute("UPDATE support_tickets SET status='resuelto', resolution=?, updated=? WHERE id=?",
+                             (title, db.now(), tid)); conn.commit()
+    else:
+        esc = (f"Nuevo mensaje de soporte que requiere respuesta humana.\n\n"
+               f"De: {sender}\nAsunto: {subject}\n\n{body}\n\n"
+               f"(Ticket #{tid}. Responde directamente al remitente.)")
+        service._send_email(ESCALATE_TO, f"[SOPORTE] {subject or '(sin asunto)'}", esc)
+        summary["escalados"] = summary.get("escalados", 0) + 1
+        summary.setdefault("detalle", []).append({"ticket": tid, "de": sender, "asunto": subject, "accion": "escalado"})
+        with db.session() as conn:
+            conn.execute("UPDATE support_tickets SET status='escalado', updated=? WHERE id=?", (db.now(), tid)); conn.commit()
+    return True
+
+
+def ingest_messages(messages) -> dict:
+    """Vía SIN IMAP: la tarea diaria lee soporte@ en el webmail de Zoho y nos pasa
+    aquí los mensajes [{id, from, subject, body}]. Reutiliza toda la lógica (acuse,
+    FAQ, escalado, tickets idempotentes)."""
+    summary = {"nuevos": 0, "acuses": 0, "resueltos": 0, "escalados": 0, "detalle": []}
+    for m in (messages or []):
+        try:
+            _handle_message(str(m.get("id") or ""), m.get("from") or "", m.get("subject") or "", m.get("body") or "", summary)
+        except Exception as e:
+            summary.setdefault("errores", []).append(str(e))
     summary["ok"] = True
     return summary
