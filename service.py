@@ -420,9 +420,37 @@ def resend_code(email: str) -> dict:
 def get_user(uid) -> dict:
     with db.session() as conn:
         row = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
-    if not row:
+    if not row or str(row["email"]).endswith("@deleted.invalid"):
         raise SferaError(401, "Usuario inválido")
     return dict(row)
+
+
+def delete_account(uid, password: str) -> dict:
+    """Eliminación de cuenta desde la app (Apple 5.1.1(v) / RGPD art. 17).
+    Borra los datos personales y vínculos de la cuenta; las aportaciones públicas
+    quedan como 'cuenta eliminada' y los votos ya emitidos son anónimos (no ligados)."""
+    import secrets as _sec
+    with db.session() as conn:
+        row = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+        if not row or not _verify_pw(password or "", row["pass_hash"]):
+            raise SferaError(403, "Contraseña incorrecta")
+        for sql in ("DELETE FROM notifications WHERE user_id=?",
+                    "DELETE FROM cert_challenges WHERE user_id=?",
+                    "DELETE FROM org_members WHERE user_id=?",
+                    "DELETE FROM grants WHERE user_id=?",
+                    "DELETE FROM debate_experts WHERE user_id=?",
+                    "DELETE FROM user_blocks WHERE blocker_id=? OR blocked_id=?"):
+            try:
+                n = sql.count("?")
+                conn.execute(sql, tuple([uid] * n))
+            except Exception:
+                pass
+        conn.execute(
+            "UPDATE users SET email=?, pass_hash=?, verified=0, is_admin=0, is_expert=0, "
+            "cert_subject=NULL, cert_pid=NULL, cert_verified_at=NULL, twofa_code=NULL WHERE id=?",
+            (f"deleted-{uid}@deleted.invalid", "deleted$" + _sec.token_hex(16), uid))
+        conn.commit()
+    return {"deleted": True}
 
 
 # ── Identidad ────────────────────────────────────────────────────────────────

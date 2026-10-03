@@ -123,6 +123,8 @@ class CertVerifyIn(BaseModel):
     fmt: str = "raw"; signed_nonce: str = ""
 class LoginIn(BaseModel):
     email: str; password: str
+class DeleteAccountIn(BaseModel):
+    password: str
 class ChangePwIn(BaseModel):
     old_password: str; new_password: str
 class DebateIn(BaseModel):
@@ -225,6 +227,10 @@ def login(i: LoginIn): return _wrap(s.login, i.email, i.password)
 @app.post("/api/change-password")
 def change_password(i: ChangePwIn, u=Depends(current_user)):
     return _wrap(s.change_password, u["id"], i.old_password, i.new_password)
+
+@app.post("/api/account/delete")
+def delete_account(i: DeleteAccountIn, u=Depends(current_user)):
+    return _wrap(s.delete_account, u["id"], i.password)
 
 
 # ── debates / fases ──────────────────────────────────────────────────────────
