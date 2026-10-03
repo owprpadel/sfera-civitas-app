@@ -375,6 +375,40 @@ CREATE TABLE IF NOT EXISTS document_ledger (
   created {REAL},
   UNIQUE (debate_id, seq)
 );
+
+-- CAPA MODERACIÓN (contenido generado por usuarios · App Store 1.2) ------------
+-- Denuncias: una por persona y contenido. target_type: debate|argument|proposal|contribution.
+CREATE TABLE IF NOT EXISTS reports (
+  id {AUTOINC},
+  reporter_id INTEGER NOT NULL REFERENCES users(id),
+  target_type TEXT NOT NULL,
+  target_id INTEGER NOT NULL,
+  target_user_id INTEGER,               -- autor del contenido denunciado (si se conoce)
+  reason TEXT NOT NULL,                 -- ofensivo | odio_acoso | spam | ilegal | otro
+  text TEXT,                            -- detalle opcional
+  status TEXT DEFAULT 'pending',        -- pending | kept | hidden | removed
+  resolved_by INTEGER,
+  resolved_at {REAL},
+  created {REAL},
+  UNIQUE (reporter_id, target_type, target_id)
+);
+-- Estado de moderación por contenido (ausente = visible). No se borra nada.
+CREATE TABLE IF NOT EXISTS content_moderation (
+  target_type TEXT NOT NULL,
+  target_id INTEGER NOT NULL,
+  status TEXT NOT NULL,                 -- auto_hidden (umbral de denuncias) | kept | hidden | removed
+  note TEXT,
+  updated {REAL},
+  updated_by INTEGER,
+  PRIMARY KEY (target_type, target_id)
+);
+-- Bloqueos entre usuarios: el bloqueador deja de ver el contenido del bloqueado.
+CREATE TABLE IF NOT EXISTS user_blocks (
+  blocker_id INTEGER NOT NULL REFERENCES users(id),
+  blocked_id INTEGER NOT NULL REFERENCES users(id),
+  created {REAL},
+  PRIMARY KEY (blocker_id, blocked_id)
+);
 """.replace("{AUTOINC}", _TYPES["AUTOINC"]).replace("{REAL}", _TYPES["REAL"])
 
 

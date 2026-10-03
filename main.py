@@ -24,6 +24,7 @@ import docs_service as ds
 import roles as rl
 import cert_service as cs
 import support_service as sup
+import moderation as mod
 
 app = FastAPI(title="Sfera Civitas — Desarrollo", version="0.1")
 _origins = os.environ.get("SFERA_CORS", "*").split(",")
@@ -39,6 +40,7 @@ _LIMITS = {  # (máx peticiones, ventana en segundos)
     "/api/resend":   (int(os.environ.get("SFERA_RL_RESEND", "5")), 900),
     "/api/cert/challenge": (int(os.environ.get("SFERA_RL_CERT", "10")), 900),
     "/api/cert/verify":    (int(os.environ.get("SFERA_RL_CERT", "10")), 900),
+    "/api/reports":        (int(os.environ.get("SFERA_RL_REPORTS", "30")), 3600),
 }
 
 
@@ -162,6 +164,12 @@ class VersionIn(BaseModel):
     file_name: Optional[str] = None; mime_type: Optional[str] = None; data_b64: Optional[str] = None
 class ContribIn(BaseModel):
     kind: str; text: str; url: Optional[str] = None
+class ReportIn(BaseModel):
+    target_type: str; target_id: int; reason: str; text: str = ""
+class ResolveIn(BaseModel):
+    target_type: str; target_id: int; action: str; note: str = ""
+class BlockIn(BaseModel):
+    user_id: int
 
 
 # ── identidad ────────────────────────────────────────────────────────────────
@@ -224,7 +232,7 @@ def change_password(i: ChangePwIn, u=Depends(current_user)):
 def create_debate(i: DebateIn, u=Depends(current_user)):
     return _wrap(s.create_debate, i.title, i.body, i.materia, i.administracion, u, i.nivel, i.territorio, i.org_id)
 @app.get("/api/debates")
-def list_debates(): return s.list_debates()
+def list_debates(u=Depends(optional_user)): return s.list_debates(u)
 @app.get("/api/config")
 def get_config(): return s.get_config()
 @app.get("/api/notifications")
@@ -314,7 +322,7 @@ def create_document(did: int, i: DocIn, u=Depends(current_user)):
     return _wrap(ds.create_document, did, u, i.doc_type, i.title, i.content_kind,
                  i.content_text, i.file_name, i.mime_type, i.data_b64)
 @app.get("/api/documents/{doc_id}")                      # LECTURA pública
-def get_document(doc_id: int): return _wrap(ds.get_document, doc_id)
+def get_document(doc_id: int, u=Depends(optional_user)): return _wrap(ds.get_document, doc_id, u)
 @app.get("/api/documents/{doc_id}/versions/{n}")         # contenido público
 def get_version_content(doc_id: int, n: int): return _wrap(ds.get_version_content, doc_id, n)
 @app.post("/api/documents/{doc_id}/versions")            # nueva versión: experto/admin
@@ -327,6 +335,27 @@ def add_contribution(doc_id: int, i: ContribIn, u=Depends(current_user)):
 def doc_ledger(did: int): return ds.get_ledger(did)
 @app.get("/api/debates/{did}/doc-audit")                 # auditoría pública del ledger
 def doc_audit(did: int): return ds.audit_ledger(did)
+
+
+# ── moderación de contenido (UGC) y bloqueos · App Store 1.2 ──────────────────
+@app.post("/api/reports")                                # denunciar (cualquier registrado)
+def report_content(i: ReportIn, u=Depends(current_user)):
+    return _wrap(mod.report_content, u, i.target_type, i.target_id, i.reason, i.text)
+@app.get("/api/moderation/reports")                      # cola de denuncias (moderador)
+def moderation_reports(status: str = "pending", u=Depends(current_user)):
+    return _wrap(mod.list_reports, u, status)
+@app.post("/api/moderation/resolve")                     # keep | hide | remove (moderador)
+def moderation_resolve(i: ResolveIn, u=Depends(current_user)):
+    return _wrap(mod.resolve, u, i.target_type, i.target_id, i.action, i.note)
+@app.get("/api/moderation/config")                       # motivos, umbral y contacto (público)
+def moderation_config():
+    return {"reasons": list(mod.REASONS), "threshold": mod.REPORT_THRESHOLD, "contact": sup.SUPPORT_ADDR}
+@app.get("/api/blocks")
+def list_blocks(u=Depends(current_user)): return _wrap(mod.list_blocks, u)
+@app.post("/api/blocks")
+def block_user(i: BlockIn, u=Depends(current_user)): return _wrap(mod.block_user, u, i.user_id)
+@app.delete("/api/blocks/{blocked_id}")
+def unblock_user(blocked_id: int, u=Depends(current_user)): return _wrap(mod.unblock_user, u, blocked_id)
 
 
 # ── frontend (PWA) ───────────────────────────────────────────────────────────

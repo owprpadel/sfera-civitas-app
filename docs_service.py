@@ -170,7 +170,7 @@ def list_documents(did: int) -> list:
     return out
 
 
-def get_document(document_id: int) -> dict:
+def get_document(document_id: int, user=None) -> dict:
     """PÚBLICO: documento + lista de versiones (metadatos) + aportaciones. Sin binarios."""
     with db.session() as conn:
         d = conn.execute("SELECT * FROM documents WHERE id=?", (document_id,)).fetchone()
@@ -182,8 +182,11 @@ def get_document(document_id: int) -> dict:
         contribs = conn.execute("""SELECT id,user_id,kind,text,url,created FROM document_contributions
                                    WHERE document_id=? ORDER BY id""", (document_id,)).fetchall()
         out = dict(d)
+        # MODERACIÓN: fuera aportaciones ocultas por denuncias y las de usuarios bloqueados.
+        import moderation
+        contribs = moderation.filter_items(conn, [dict(c) for c in contribs], "contribution", user)
     out["versions"] = [dict(v) for v in vers]
-    out["contributions"] = [dict(c) for c in contribs]
+    out["contributions"] = contribs
     return out
 
 

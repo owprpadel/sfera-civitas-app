@@ -900,31 +900,42 @@ def support_debate(did: int, user) -> dict:
     return {"already": bool(already), "via": via, **conv}
 
 
-def list_debates() -> list:
+def list_debates(user=None) -> list:
     # No se listan los asuntos archivados (hidden=1): p.ej. datos de prueba.
     # Se añade 'aportaciones' = nº de argumentos + propuestas (participación real en deliberación).
+    # MODERACIÓN: se excluyen los ocultos por denuncias/moderador y, si hay sesión,
+    # los convocados por usuarios que esta persona ha bloqueado.
+    import moderation
     with db.session() as conn:
         rows = [dict(r) for r in conn.execute(
             "SELECT d.*, "
             "(SELECT COUNT(*) FROM arguments a WHERE a.debate_id=d.id) + "
             "(SELECT COUNT(*) FROM proposals p WHERE p.debate_id=d.id) AS aportaciones "
             "FROM debates d WHERE COALESCE(d.hidden,0)=0 AND d.org_id IS NULL ORDER BY d.id DESC").fetchall()]
+        rows = moderation.filter_items(conn, rows, "debate", user, author_key="created_by")
         for r in rows:
             r.update(_conv_apply(conn, r))   # estado de convocatoria + avance/caducidad perezosos
     return rows
 
 
 def get_debate(did: int, user=None) -> dict:
+    import moderation
     with db.session() as conn:
         d = conn.execute("SELECT * FROM debates WHERE id=?", (did,)).fetchone()
         if not d:
             raise SferaError(404, "No existe")
+        # MODERACIÓN: un asunto oculto (denuncias/moderador) solo lo ven los moderadores.
+        if did in moderation.hidden_ids(conn, "debate") and not moderation.can_moderate(conn, user):
+            raise SferaError(404, "Este asunto está oculto, pendiente de revisión de moderación")
         # Asuntos PRIVADOS: solo visibles para el censo de su organización.
         oid = d["org_id"] if "org_id" in d.keys() else None
         if oid and not (user and _is_org_member(conn, oid, user["id"])):
             raise SferaError(403, "Asunto privado: solo para miembros de la organización")
         args = [dict(r) for r in conn.execute("SELECT * FROM arguments WHERE debate_id=? ORDER BY id", (did,)).fetchall()]
         props = [dict(r) for r in conn.execute("SELECT * FROM proposals WHERE debate_id=? ORDER BY id", (did,)).fetchall()]
+        # MODERACIÓN: fuera lo oculto por denuncias y lo de usuarios bloqueados por quien mira.
+        args = moderation.filter_items(conn, args, "argument", user)
+        props = moderation.filter_items(conn, props, "proposal", user)
         elec = conn.execute("SELECT id,question,options_json,status FROM elections WHERE debate_id=? ORDER BY id DESC", (did,)).fetchone()
         out = dict(d)
         out.update(_conv_apply(conn, d))   # estado de convocatoria (doble vía) + avance/caducidad
