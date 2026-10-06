@@ -19,6 +19,7 @@ MEJORAS DE SEGURIDAD aplicadas:
   · Tablón: nº de secuencia protegido con bloqueo de fila + UNIQUE (anti-carrera).
 """
 from __future__ import annotations
+import re
 import base64
 import hashlib
 import hmac
@@ -453,9 +454,44 @@ def delete_account(uid, password: str) -> dict:
     return {"deleted": True}
 
 
+# ── Cuenta demo para revisión de tiendas (App Store / Google Play) ────────────
+def ensure_demo_account() -> dict:
+    """Crea/garantiza una cuenta DEMO ya verificada, sin paso 2FA, para que el
+    revisor de Apple/Google pueda iniciar sesión directamente.
+    Idempotente: si no existe la crea; si existe, la deja verificada y refresca
+    la contraseña. Credenciales por entorno (SFERA_DEMO_EMAIL / SFERA_DEMO_PASSWORD)
+    con valores por defecto para que funcione sin configurar nada. Cuenta 'open',
+    NO admin, sin privilegios especiales."""
+    email = (os.environ.get("SFERA_DEMO_EMAIL", "demo@sferacivitas.org") or "").strip().lower()
+    password = os.environ.get("SFERA_DEMO_PASSWORD", "SferaDemo-2026")
+    if not email or not password:
+        return {"demo": False, "reason": "sin credenciales"}
+    try:
+        with db.session() as conn:
+            row = conn.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
+            if row:
+                conn.execute(
+                    "UPDATE users SET pass_hash=?, verified=1, twofa_code=NULL WHERE id=?",
+                    (_hash_pw(password), row["id"]))
+            else:
+                conn.execute(
+                    "INSERT INTO users(email,pass_hash,verified,loa,is_admin,twofa_code,created) "
+                    "VALUES(?,?,1,'open',0,NULL,?)",
+                    (email, _hash_pw(password), db.now()))
+            conn.commit()
+        return {"demo": True, "email": email}
+    except Exception as e:
+        return {"demo": False, "reason": str(e)}
+
+
 # ── Identidad ────────────────────────────────────────────────────────────────
 def register(email: str, password: str) -> dict:
     """Registro tipo X (vía abierta): email + contraseña + 2FA. LoA = 'open'."""
+    email = (email or "").strip()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise SferaError(400, "Escribe un email válido")
+    if not password or len(password) < 8:
+        raise SferaError(400, "La contraseña debe tener al menos 8 caracteres")
     with db.session() as conn:
         if conn.execute("SELECT 1 FROM users WHERE email=?", (email,)).fetchone():
             raise SferaError(400, "Email ya registrado")
