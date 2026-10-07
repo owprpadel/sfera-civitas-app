@@ -58,6 +58,15 @@ class _Cur:
     def lastrowid(self):
         return self._cur.lastrowid if self._backend == "sqlite" else self._lastid
 
+    @property
+    def rowcount(self):
+        """Filas afectadas por un UPDATE/DELETE (ambos backends). Permite los
+        UPDATE condicionales «solo si sigue en la fase X» (avance de fase una sola vez)."""
+        try:
+            return self._cur.rowcount
+        except Exception:
+            return -1
+
 
 class Conn:
     """Conexión uniforme. `execute(sql, params, returning=True)` en un INSERT
@@ -174,6 +183,28 @@ CREATE TABLE IF NOT EXISTS debates (
   conv_status TEXT DEFAULT 'recabando', -- CONVOCATORIA (fase 0): recabando | avanzado | caducado
   conv_deadline {REAL},                 -- fecha límite para reunir el quórum (createdAt + 2 semanas)
   qualified_track TEXT,                 -- vía que alcanzó el umbral: 'abierto' | 'verificado' | NULL
+  phase_deadline {REAL},                -- fin de la fase ACTUAL (deliberar/proponer/votar); avance perezoso al vencer
+  created {REAL}
+);
+-- FASE PROPONER: apoyos a propuestas CIUDADANAS (uno por persona y propuesta). Son
+-- insumo para los expertos; NO se votan (la papeleta = propuestas expertas, ver abajo).
+CREATE TABLE IF NOT EXISTS proposal_supports (
+  proposal_id INTEGER NOT NULL REFERENCES proposals(id),
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  created {REAL},
+  PRIMARY KEY (proposal_id, user_id)
+);
+-- AMPLIACIONES DE PLAZO de una fase: públicas y justificadas (admin) o automáticas (sistema).
+CREATE TABLE IF NOT EXISTS phase_extensions (
+  id {AUTOINC},
+  debate_id INTEGER NOT NULL REFERENCES debates(id),
+  phase TEXT NOT NULL,                  -- fase cuyo plazo se amplía
+  days INTEGER NOT NULL,
+  justification TEXT NOT NULL,          -- motivo (obligatorio, se muestra en el asunto)
+  user_id INTEGER,                      -- admin que amplía; NULL = ampliación automática
+  auto INTEGER DEFAULT 0,               -- 1 = ampliación automática del sistema
+  old_deadline {REAL},
+  new_deadline {REAL},
   created {REAL}
 );
 -- CONVOCATORIA (Fase 0): apoyos por VÍA. Doctrina: doble vía que NO se fusiona.
@@ -263,6 +294,40 @@ CREATE TABLE IF NOT EXISTS proposals (
   text TEXT NOT NULL,
   created {REAL}
 );
+
+-- PROPUESTAS EXPERTAS (decisión del fundador, oct-2026): SOLO estas se votan.
+-- Las redactan, en la fase Proponer, los expertos asignados al asunto (o su admin)
+-- a partir de la deliberación y de las propuestas ciudadanas. Máximo 5 por asunto.
+-- Papeleta = títulos de las propuestas expertas + «Ninguna / mantener como está».
+CREATE TABLE IF NOT EXISTS expert_proposals (
+  id {AUTOINC},
+  debate_id INTEGER NOT NULL REFERENCES debates(id),
+  author_id INTEGER NOT NULL REFERENCES users(id),
+  author_role TEXT DEFAULT 'experto',   -- 'experto' | 'admin' (etiqueta pública; no se expone el email)
+  title TEXT NOT NULL,                  -- texto de la opción en la papeleta
+  text TEXT NOT NULL,
+  justification TEXT,                   -- opcional: puede citar propuestas ciudadanas / argumentos
+  created {REAL},
+  hidden INTEGER DEFAULT 0              -- 1 = retirada (no entra en la papeleta)
+);
+-- «ÚTIL»: una marca por persona y aportación (se puede quitar). Sirve para ordenar
+-- miles de argumentos / propuestas ciudadanas y llevar arriba lo más valioso.
+CREATE TABLE IF NOT EXISTS argument_utiles (
+  argument_id INTEGER NOT NULL REFERENCES arguments(id),
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  created {REAL},
+  PRIMARY KEY (argument_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS proposal_utiles (
+  proposal_id INTEGER NOT NULL REFERENCES proposals(id),
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  created {REAL},
+  PRIMARY KEY (proposal_id, user_id)
+);
+-- Índices para listados paginados con miles de aportaciones (idempotentes).
+CREATE INDEX IF NOT EXISTS ix_arguments_debate ON arguments(debate_id);
+CREATE INDEX IF NOT EXISTS ix_proposals_debate ON proposals(debate_id);
+CREATE INDEX IF NOT EXISTS ix_expert_proposals_debate ON expert_proposals(debate_id);
 
 -- CAPA VOTO -------------------------------------------------------------------
 -- Una clave ElGamal (recuento homomórfico) y una clave de firma ciega POR VÍA.
@@ -443,6 +508,8 @@ def init_db():
         conn.execute("ALTER TABLE debates ADD COLUMN IF NOT EXISTS conv_deadline DOUBLE PRECISION")
         conn.execute("ALTER TABLE debates ADD COLUMN IF NOT EXISTS qualified_track TEXT")
         conn.execute("ALTER TABLE debates ADD COLUMN IF NOT EXISTS org_id INTEGER")
+        # Fases con plazo propio (avance perezoso). NULL en asuntos previos: se fija en la 1ª lectura.
+        conn.execute("ALTER TABLE debates ADD COLUMN IF NOT EXISTS phase_deadline DOUBLE PRECISION")
         # Pago por uso (parte privada)
         conn.execute("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS paid_units INTEGER DEFAULT 0")
         conn.execute("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS active_until DOUBLE PRECISION")
@@ -485,7 +552,8 @@ def init_db():
                          ("conv_status", "ALTER TABLE debates ADD COLUMN conv_status TEXT DEFAULT 'recabando'"),
                          ("conv_deadline", "ALTER TABLE debates ADD COLUMN conv_deadline REAL"),
                          ("qualified_track", "ALTER TABLE debates ADD COLUMN qualified_track TEXT"),
-                         ("org_id", "ALTER TABLE debates ADD COLUMN org_id INTEGER")):
+                         ("org_id", "ALTER TABLE debates ADD COLUMN org_id INTEGER"),
+                         ("phase_deadline", "ALTER TABLE debates ADD COLUMN phase_deadline REAL")):
             if col not in dcols:
                 conn._raw.execute(ddl)  # type: ignore[attr-defined]
                 conn.commit()

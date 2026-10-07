@@ -28,6 +28,7 @@ TARGETS = {
     "argument": ("arguments", "user_id", "text"),
     "proposal": ("proposals", "user_id", "text"),
     "contribution": ("document_contributions", "user_id", "text"),
+    "expert_proposal": ("expert_proposals", "author_id", "title"),
 }
 # Estados en content_moderation que retiran el contenido de las vistas públicas.
 HIDDEN_STATES = ("auto_hidden", "hidden", "removed")

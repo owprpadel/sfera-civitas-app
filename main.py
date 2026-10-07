@@ -8,6 +8,7 @@ Arranque:
 """
 from __future__ import annotations
 import os
+import re
 import time
 from collections import defaultdict, deque
 from typing import Optional
@@ -42,17 +43,36 @@ _LIMITS = {  # (máx peticiones, ventana en segundos)
     "/api/cert/verify":    (int(os.environ.get("SFERA_RL_CERT", "10")), 900),
     "/api/reports":        (int(os.environ.get("SFERA_RL_REPORTS", "30")), 3600),
 }
+# Rutas de escritura con id en la URL: el límite se aplica POR TIPO (todas las
+# rutas que casan con el patrón comparten contador por IP).
+_PATTERN_LIMITS = [
+    (re.compile(r"^/api/(arguments|proposals)/\d+/util$"), "util",
+     (int(os.environ.get("SFERA_RL_UTIL", "300")), 3600)),
+    (re.compile(r"^/api/debates/\d+/expert-proposals$"), "expert",
+     (int(os.environ.get("SFERA_RL_EXPERT", "30")), 3600)),
+    (re.compile(r"^/api/expert-proposals/\d+/withdraw$"), "expert",
+     (int(os.environ.get("SFERA_RL_EXPERT", "30")), 3600)),
+]
+
+
+def _limit_for(path: str):
+    if path in _LIMITS:
+        return _LIMITS[path], path
+    for rx, key, lim in _PATTERN_LIMITS:
+        if rx.match(path):
+            return lim, key
+    return None, None
 
 
 @app.middleware("http")
 async def rate_limit(request: Request, call_next):
-    limit = _LIMITS.get(request.url.path)
+    limit, key = _limit_for(request.url.path)
     if limit and request.method == "POST":
         ip = (request.headers.get("x-forwarded-for", "").split(",")[0].strip()
               or (request.client.host if request.client else "?"))
         maxn, window = limit
         now = time.time()
-        dq = _HITS[(ip, request.url.path)]
+        dq = _HITS[(ip, key)]
         while dq and dq[0] < now - window:
             dq.popleft()
         if len(dq) >= maxn:
@@ -67,6 +87,11 @@ app.add_middleware(CORSMiddleware, allow_origins=[o.strip() for o in _origins],
                    allow_methods=["*"], allow_headers=["*"])
 
 db.init_db()
+try:
+    _demo = s.ensure_demo_account()  # cuenta demo verificada para revisión de tiendas
+    print(f"[sfera] demo account: {_demo}")
+except Exception as _e:
+    print(f"[sfera] demo account seed error: {_e}")
 WEB_DIR = os.path.join(os.path.dirname(__file__), "..", "web")
 
 
@@ -138,10 +163,14 @@ class InviteAcceptIn(BaseModel):
     token: str
 class PhaseIn(BaseModel):
     phase: str
+class ExtendIn(BaseModel):
+    days: int; justification: str
 class ArgIn(BaseModel):
     stance: str = "matiz"; text: str
 class PropIn(BaseModel):
     text: str
+class ExpertPropIn(BaseModel):
+    title: str; text: str; justification: str = ""
 class ElectionIn(BaseModel):
     question: str; options: list[str]
 class CredIn(BaseModel):
@@ -275,12 +304,39 @@ def get_debate(did: int, u=Depends(optional_user)): return _wrap(s.get_debate, d
 def support_debate(did: int, u=Depends(current_user)): return _wrap(s.support_debate, did, u)
 @app.post("/api/debates/{did}/phase")
 def set_phase(did: int, i: PhaseIn, u=Depends(current_user)): return _wrap(s.set_phase, did, i.phase, u)
+@app.post("/api/debates/{did}/extend")                   # ampliar plazo de la fase actual (admin, con justificación pública)
+def extend_phase(did: int, i: ExtendIn, u=Depends(current_user)):
+    return _wrap(s.extend_phase, did, i.days, i.justification, u)
+@app.post("/api/proposals/{pid}/support")                # apoyar una propuesta (solo en fase Proponer)
+def support_proposal(pid: int, u=Depends(current_user)): return _wrap(s.support_proposal, pid, u)
 @app.post("/api/debates/{did}/arguments")
 def add_argument(did: int, i: ArgIn, u=Depends(current_user)):
     return _wrap(s.add_argument, did, u["id"], i.stance, i.text)
 @app.post("/api/debates/{did}/proposals")
 def add_proposal(did: int, i: PropIn, u=Depends(current_user)):
     return _wrap(s.add_proposal, did, u["id"], i.text)
+# ── Escala: listados paginados + «Útil» (una marca por persona; se puede quitar) ──
+@app.get("/api/debates/{did}/arguments")                 # ?sort=utiles|recientes&stance=favor|contra|matiz&limit=20&offset=0
+def list_arguments(did: int, sort: str = "utiles", stance: str = "", limit: int = 20, offset: int = 0,
+                   u=Depends(optional_user)):
+    return _wrap(s.list_arguments, did, u, sort, stance or None, limit, offset)
+@app.get("/api/debates/{did}/proposals")                 # propuestas CIUDADANAS · ?sort=apoyos|utiles|recientes
+def list_proposals(did: int, sort: str = "apoyos", limit: int = 20, offset: int = 0, u=Depends(optional_user)):
+    return _wrap(s.list_proposals, did, u, sort, limit, offset)
+@app.post("/api/arguments/{aid}/util")                   # «Útil» en un argumento (solo en Deliberar) · ?on=true|false (vacío = alterna)
+def util_argument(aid: int, on: Optional[bool] = None, u=Depends(current_user)):
+    return _wrap(s.toggle_util, "argument", aid, u, on)
+@app.post("/api/proposals/{pid}/util")                   # «Útil» en una propuesta ciudadana (solo en Proponer)
+def util_proposal(pid: int, on: Optional[bool] = None, u=Depends(current_user)):
+    return _wrap(s.toggle_util, "proposal", pid, u, on)
+# ── Propuestas EXPERTAS (las únicas que se votan; máx. 5 por asunto) ──
+@app.get("/api/debates/{did}/expert-proposals")
+def list_expert_proposals(did: int, u=Depends(optional_user)): return _wrap(s.list_expert_proposals, did, u)
+@app.post("/api/debates/{did}/expert-proposals")         # experto del asunto o admin, solo en Proponer
+def add_expert_proposal(did: int, i: ExpertPropIn, u=Depends(current_user)):
+    return _wrap(s.add_expert_proposal, did, u, i.title, i.text, i.justification)
+@app.post("/api/expert-proposals/{epid}/withdraw")       # retirar (autor o admin), solo en Proponer
+def withdraw_expert_proposal(epid: int, u=Depends(current_user)): return _wrap(s.withdraw_expert_proposal, epid, u)
 
 
 # ── voto ─────────────────────────────────────────────────────────────────────
