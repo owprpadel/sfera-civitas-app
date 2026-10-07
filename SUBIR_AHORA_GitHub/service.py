@@ -37,8 +37,41 @@ import crypto_core as cc
 import crypto_zk as zk
 
 PHASES = ["convocar", "deliberar", "proponer", "votar", "publicar"]
-VOTACION_DIAS = 14  # ventana estándar de una votación (días) para fijar la fecha de cierre
+VOTACION_DIAS = int(os.environ.get("SFERA_VOTACION_DIAS", "14"))  # ventana estándar de una votación (días)
 VIAS = ("open", "verified")
+
+# ── FASES CON PLAZO PROPIO (decisión del fundador, oct-2026) ──────────────────
+# Las fases avanzan EN ORDEN y solo la fase actual admite acciones:
+#   convocar  → quórum en CONV_DIAS (ver _conv_apply) → deliberar (o caduca)
+#   deliberar → solo argumentos; al vencer DELIB_DIAS → proponer
+#   proponer  → cualquier registrado presenta y apoya PROPUESTAS CIUDADANAS (insumo,
+#               NO se votan). Los EXPERTOS del asunto (o su admin) publican hasta
+#               EXPERT_MAX «propuestas expertas». Al vencer PROP_DIAS → papeleta =
+#               títulos de las propuestas expertas + NONE_OPTION y se abre la
+#               votación cifrada. Con 0 propuestas expertas: se amplía UNA vez
+#               PROP_EXT_DIAS (aviso a admins y expertos); si sigue a 0,
+#               conv_status='sin_propuestas_expertas' y se detiene (una ampliación
+#               del admin lo reactiva).
+#   votar     → al vencer VOTACION_DIAS → recuento + tablón + publicar
+#   publicar  → solo lectura
+# «Los expertos guían, no deciden»: decide la ciudadanía votando.
+# No hay cron: el avance es PEREZOSO (se aplica al leer o escribir un asunto),
+# idempotente y a prueba de concurrencia (bloqueo de fila + UPDATE condicional).
+# Los plazos encadenados se calculan desde el vencimiento anterior, de modo que
+# un asunto que nadie ha abierto en semanas se pone al día correctamente.
+DELIB_DIAS = int(os.environ.get("SFERA_DELIB_DIAS", "14"))
+PROP_DIAS = int(os.environ.get("SFERA_PROP_DIAS", "14"))
+PROP_EXT_DIAS = int(os.environ.get("SFERA_PROP_EXT_DIAS", "7"))   # ampliación automática si no hay propuestas expertas
+EXPERT_MAX = 5                       # máx. propuestas expertas por asunto (= opciones de la papeleta sin «Ninguna»)
+BALLOT_MAX = EXPERT_MAX
+NONE_OPTION = "Ninguna / mantener como está"
+PHASE_DIAS = {"deliberar": DELIB_DIAS, "proponer": PROP_DIAS, "votar": VOTACION_DIAS}
+EXT_MAX_DIAS = 90
+# Estados de un asunto DETENIDO en Proponer (sin propuestas). 'sin_propuestas' es el
+# nombre anterior (motor de papeleta ciudadana); se trata igual por compatibilidad.
+STOPPED = ("sin_propuestas_expertas", "sin_propuestas")
+EMBED_MAX = 10                       # get_debate incrusta solo el top-10 (el resto, por la API paginada)
+PAGE_MAX = 50
 
 # ── CONVOCATORIA (Fase 0) — DOCTRINA: doble vía que NUNCA se fusiona ───────────
 # Un asunto recién convocado tiene CONV_DIAS para reunir el quórum. Avanza si
@@ -75,10 +108,14 @@ def _conv_apply(conn, d, persist=True) -> dict:
             qual = "verificado" if ve >= CONV_QUORUM_VERIF else "abierto"
             conv_status = "avanzado"; phase = "deliberar"
             if persist:
-                conn.execute("UPDATE debates SET phase='deliberar', conv_status='avanzado', qualified_track=? WHERE id=?", (qual, did))
+                # UPDATE condicional: solo avanza (y avisa) quien lo consigue primero.
+                cur = conn.execute("UPDATE debates SET phase='deliberar', conv_status='avanzado', qualified_track=?, "
+                                   "phase_deadline=? WHERE id=? AND phase='convocar'",
+                                   (qual, db.now() + DELIB_DIAS * 86400, did))
                 conn.commit()
-                try: _on_prospera(conn, d, qual)   # avisos in-app + email a admins (asignar expertos)
-                except Exception: pass
+                if cur.rowcount != 0:
+                    try: _on_prospera(conn, d, qual)   # avisos in-app + email a admins (asignar expertos)
+                    except Exception: pass
         elif deadline is not None and db.now() > float(deadline):
             conv_status = "caducado"
             if persist:
@@ -102,6 +139,14 @@ def get_config() -> dict:
     return {
         "phases": PHASES,
         "fase_dias": VOTACION_DIAS,
+        "delib_dias": DELIB_DIAS,
+        "prop_dias": PROP_DIAS,
+        "prop_ext_dias": PROP_EXT_DIAS,
+        "votacion_dias": VOTACION_DIAS,
+        "ballot_max": BALLOT_MAX,
+        "expert_max": EXPERT_MAX,
+        "ballot_source": "expertas",     # la papeleta = propuestas expertas + «Ninguna»
+        "none_option": NONE_OPTION,
         "conv_dias": CONV_DIAS,
         "conv_quorum_abierto": CONV_QUORUM,
         "conv_quorum_verificado": CONV_QUORUM_VERIF,
@@ -684,8 +729,11 @@ def list_org_debates(user, org_id: int) -> list:
         rows = [dict(r) for r in conn.execute(
             "SELECT d.*, "
             "(SELECT COUNT(*) FROM arguments a WHERE a.debate_id=d.id) + "
-            "(SELECT COUNT(*) FROM proposals p WHERE p.debate_id=d.id) AS aportaciones "
+            "(SELECT COUNT(*) FROM proposals p WHERE p.debate_id=d.id) + "
+            "(SELECT COUNT(*) FROM expert_proposals x WHERE x.debate_id=d.id AND COALESCE(x.hidden,0)=0) AS aportaciones "
             "FROM debates d WHERE d.org_id=? AND COALESCE(d.hidden,0)=0 ORDER BY d.id DESC", (org_id,)).fetchall()]
+        for r in rows:
+            r.update(_safe_refresh(conn, r))   # avance perezoso de fases también en lo privado
     return rows
 
 
@@ -916,10 +964,10 @@ def create_debate(title, body, materia, administracion, user, nivel="", territor
                 raise SferaError(403, "No perteneces a esta organización")
             cur = conn.execute(
                 "INSERT INTO debates(title,body,materia,administracion,nivel,territorio,"
-                "phase,visibility,org_id,created_by,conv_status,created) "
-                "VALUES(?,?,?,?,?,?,'deliberar','private',?,?,'avanzado',?)",
+                "phase,visibility,org_id,created_by,conv_status,phase_deadline,created) "
+                "VALUES(?,?,?,?,?,?,'deliberar','private',?,?,'avanzado',?,?)",
                 (title, body, materia, administracion, (nivel or None), (territorio or None),
-                 org_id, user["id"], now), returning=True)
+                 org_id, user["id"], now + DELIB_DIAS * 86400, now), returning=True)
             conn.commit()
             return {"debate_id": cur.lastrowid, "phase": "deliberar", "visibility": "private", "org_id": org_id}
         # Público: convocatoria con doble vía
@@ -974,114 +1022,867 @@ def list_debates(user=None) -> list:
         rows = [dict(r) for r in conn.execute(
             "SELECT d.*, "
             "(SELECT COUNT(*) FROM arguments a WHERE a.debate_id=d.id) + "
-            "(SELECT COUNT(*) FROM proposals p WHERE p.debate_id=d.id) AS aportaciones "
+            "(SELECT COUNT(*) FROM proposals p WHERE p.debate_id=d.id) + "
+            "(SELECT COUNT(*) FROM expert_proposals x WHERE x.debate_id=d.id AND COALESCE(x.hidden,0)=0) AS aportaciones "
             "FROM debates d WHERE COALESCE(d.hidden,0)=0 AND d.org_id IS NULL ORDER BY d.id DESC").fetchall()]
         rows = moderation.filter_items(conn, rows, "debate", user, author_key="created_by")
         for r in rows:
-            r.update(_conv_apply(conn, r))   # estado de convocatoria + avance/caducidad perezosos
+            # convocatoria + avance/caducidad perezosos + plazo de la fase actual
+            r.update(_safe_refresh(conn, r))
     return rows
 
 
-def get_debate(did: int, user=None) -> dict:
+# ── MOTOR DE FASES (avance perezoso, idempotente, a prueba de concurrencia) ────
+def _get(d, k, default=None):
+    try:
+        return d[k] if k in d.keys() else default
+    except Exception:
+        return default
+
+
+def _row(conn, did):
+    r = conn.execute("SELECT * FROM debates WHERE id=?", (did,)).fetchone()
+    return dict(r) if r else None
+
+
+def _dias_restantes(deadline):
+    if deadline is None:
+        return None
+    left = float(deadline) - db.now()
+    return max(0, int(left // 86400) + (1 if left % 86400 else 0))
+
+
+def _stopped(d) -> bool:
+    """Asunto detenido en Proponer por falta de propuestas (expertas)."""
+    return _get(d, "conv_status") in STOPPED
+
+
+def _phase_due(d) -> bool:
+    """¿Hay que actuar sobre la fase actual? (plazo vencido o sin plazo fijado)."""
+    ph = _get(d, "phase")
+    if ph not in PHASE_DIAS:
+        return False
+    if _stopped(d):
+        return False
+    dl = _get(d, "phase_deadline")
+    return dl is None or db.now() > float(dl)
+
+
+def _phase_info(d) -> dict:
+    ph = _get(d, "phase")
+    if ph == "convocar":
+        dl = _get(d, "conv_deadline")
+    elif ph in PHASE_DIAS and not _stopped(d):
+        dl = _get(d, "phase_deadline")
+    else:
+        dl = None
+    return {"phase_deadline": dl, "phase_dias_restantes": _dias_restantes(dl)}
+
+
+def _latest_election(conn, did):
+    e = conn.execute("SELECT * FROM elections WHERE debate_id=? ORDER BY id DESC LIMIT 1", (did,)).fetchone()
+    return dict(e) if e else None
+
+
+def _open_election_row(conn, did):
+    e = conn.execute("SELECT * FROM elections WHERE debate_id=? AND status='abierta' ORDER BY id DESC LIMIT 1",
+                     (did,)).fetchone()
+    return dict(e) if e else None
+
+
+def _expert_proposals(conn, did) -> list:
+    """Propuestas EXPERTAS visibles (sin retiradas ni ocultas por moderación), en
+    orden de publicación. Son las ÚNICAS que forman la papeleta."""
     import moderation
+    rows = [dict(r) for r in conn.execute(
+        "SELECT id, debate_id, author_id, author_role, title, text, justification, created "
+        "FROM expert_proposals WHERE debate_id=? AND COALESCE(hidden,0)=0 ORDER BY id", (did,)).fetchall()]
+    hid = moderation.hidden_ids(conn, "expert_proposal")
+    return [r for r in rows if int(r["id"]) not in hid]
+
+
+def _ballot_options(eprops: list) -> list:
+    """Papeleta: títulos de las propuestas expertas (máx. EXPERT_MAX) + «Ninguna / mantener como está»."""
+    opts, seen = [], set()
+    for p in eprops[:EXPERT_MAX]:
+        t = (p.get("title") or "").strip()
+        if t and t.lower() not in seen and t.lower() != NONE_OPTION.lower():
+            seen.add(t.lower()); opts.append(t)
+    return opts + [NONE_OPTION]
+
+
+def _expert_recipients(conn, d) -> list:
+    """Expertos del asunto: asignados (debate_experts) + concesiones 'expert' de su
+    ámbito (global / AAPP / materia / asunto). Devuelve [(user_id, email)] sin duplicados."""
+    out = {}
+    for r in conn.execute("SELECT u.id AS id, u.email AS email FROM debate_experts de "
+                          "JOIN users u ON u.id=de.user_id WHERE de.debate_id=?", (d["id"],)).fetchall():
+        rr = dict(r); out[rr["id"]] = rr["email"]
+    adm = (_get(d, "administracion") or ""); mat = (_get(d, "materia") or "")
+    for r in conn.execute("SELECT u.id AS id, u.email AS email, g.scope_type AS st, g.scope_value AS sv "
+                          "FROM grants g JOIN users u ON u.id=g.user_id WHERE g.role='expert'").fetchall():
+        rr = dict(r)
+        if (rr["st"] == "global" or (rr["st"] == "aapp" and rr["sv"] == adm)
+                or (rr["st"] == "materia" and rr["sv"] == mat)
+                or (rr["st"] == "debate" and str(rr["sv"]) == str(d["id"]))):
+            out[rr["id"]] = rr["email"]
+    return list(out.items())
+
+
+def _notify_phase(conn, d, text, admins=False, experts=False, creator=True, email_subject=None):
+    """Aviso in-app (y opcionalmente email en segundo plano) al proponente y, si se
+    pide, a los admins y/o expertos del asunto. Nunca rompe una transición."""
+    try:
+        sent = set()
+        if creator and _get(d, "created_by"):
+            _notify(conn, _get(d, "created_by"), "fase", d["id"], text); sent.add(_get(d, "created_by"))
+        targets = (_admin_recipients(conn, d) if admins else []) + (_expert_recipients(conn, d) if experts else [])
+        for uid, email in targets:
+            if uid in sent:
+                continue
+            sent.add(uid)
+            _notify(conn, uid, "fase", d["id"], text)
+            if email_subject and email:
+                _send_email_async(email, email_subject, f"{text}\n\n{APP_URL}/#asunto-{d['id']}\n")
+    except Exception:
+        pass
+
+
+def _on_proponer(conn, d):
+    """Avisos al abrirse Proponer: proponente + expertos (ya pueden redactar)."""
+    _notify_phase(conn, d, f"«{d['title']}» pasa a la fase de Propuestas.")
+    _notify_phase(conn, d, f"«{d['title']}» está en Propuestas: como experto/a ya puedes publicar las "
+                           f"propuestas expertas que se votarán (máx. {EXPERT_MAX}).",
+                  experts=True, creator=False)
+
+
+
+def _create_election(conn, did, question, options, n_trustees: int = 3) -> int:
+    """Crea la elección cifrada (custodios distribuidos + firma ciega por vía) y su
+    génesis en el tablón, SOBRE la conexión dada (sin commit). No toca el asunto."""
+    shares, H = zk.gen_trustees(n_trustees)
+    epub = cc.ElgamalPub(cc.P, cc.G, H)
+    s_open = cc.BlindSigner(2048)
+    s_ver = cc.BlindSigner(2048)
+    cur = conn.execute("""INSERT INTO elections(debate_id,question,options_json,status,elgamal_pub_json,trustees_json,
+                blind_open_n,blind_open_e,blind_open_d,blind_verified_n,blind_verified_e,blind_verified_d,created)
+                VALUES(?,?,?,'abierta',?,?,?,?,?,?,?,?,?)""",
+                       (did, question, json.dumps(options),
+                        json.dumps({"p": str(epub.p), "g": str(epub.g), "h": str(epub.h)}),
+                        _enc(json.dumps([str(s.x) for s in shares])),   # shares CIFRADAS en reposo
+                        str(s_open.n), str(s_open.e), _enc(str(s_open.d)),        # d privada CIFRADA
+                        str(s_ver.n), str(s_ver.e), _enc(str(s_ver.d)), db.now()), returning=True)
+    eid = cur.lastrowid
+    payload = json.dumps({"question": question, "options": options, "n_custodios": n_trustees,
+                          "elgamal_pub": {"p": str(epub.p), "g": str(epub.g), "h": str(epub.h)},
+                          "blind_pub": {"open": {"n": str(s_open.n), "e": str(s_open.e)},
+                                        "verified": {"n": str(s_ver.n), "e": str(s_ver.e)}}}, sort_keys=True)
+    entry_hash = cc.chain_hash("GENESIS", payload)
+    conn.execute("INSERT INTO bulletin_board(election_id,seq,kind,via,payload_json,prev_hash,entry_hash,created) VALUES(?,?,?,?,?,?,?,?)",
+                 (eid, 0, "genesis", None, payload, "GENESIS", entry_hash, db.now()))
+    return eid
+
+
+def _tally_close(conn, e) -> dict:
+    """Recuento homomórfico por vía + resultado al tablón + elección cerrada +
+    asunto a 'publicar'. Sobre la conexión dada (sin commit). El llamante debe
+    tener bloqueadas las filas del asunto y de la elección."""
+    eid = e["id"]
+    options = json.loads(e["options_json"])
+    rows = conn.execute("SELECT via,payload_json FROM bulletin_board WHERE election_id=? AND kind='ballot' ORDER BY seq", (eid,)).fetchall()
+    shares = [zk.TrusteeShare(x=int(xs), h=pow(cc.G, int(xs), cc.P)) for xs in json.loads(_dec(e["trustees_json"]))]
+    result = {}
+    for via in VIAS:
+        bv = [json.loads(r["payload_json"])["ballot"] for r in rows if r["via"] == via]
+        totals = _tally_via(options, bv, shares, len(bv))
+        result[via] = {"total_votos": len(bv), "opciones": options, "recuento": totals,
+                       "umbral_convocatoria": UMBRAL[via], "garantia": "alta" if via == "verified" else "abierta"}
+    result["n_custodios"] = len(shares)
+    result["nota"] = "Vías separadas por garantía; nunca se mezclan (doctrina §3.2)."
+    for via in VIAS:
+        last = conn.execute("SELECT seq,entry_hash FROM bulletin_board WHERE election_id=? ORDER BY seq DESC LIMIT 1", (eid,)).fetchone()
+        seq = last["seq"] + 1
+        payload = json.dumps({"via": via, "result": result[via]}, sort_keys=True)
+        entry_hash = cc.chain_hash(last["entry_hash"], payload)
+        conn.execute("INSERT INTO bulletin_board(election_id,seq,kind,via,payload_json,prev_hash,entry_hash,created) VALUES(?,?,?,?,?,?,?,?)",
+                     (eid, seq, "result", via, payload, last["entry_hash"], entry_hash, db.now()))
+    conn.execute("UPDATE elections SET status='cerrada', result_json=? WHERE id=?", (json.dumps(result), eid))
+    conn.execute("UPDATE debates SET phase='publicar', phase_deadline=NULL WHERE id=?", (e["debate_id"],))
+    return result
+
+
+def _open_vote(conn, d, deadline, eprops=None) -> bool:
+    """Abre la votación con la papeleta de PROPUESTAS EXPERTAS (+ «Ninguna»). Sin
+    commit. Devuelve False si no hay ninguna propuesta experta."""
+    eprops = _expert_proposals(conn, d["id"]) if eprops is None else eprops
+    if not eprops:
+        return False
+    _create_election(conn, d["id"], d["title"], _ballot_options(eprops))
+    conn.execute("UPDATE debates SET phase='votar', phase_deadline=?, cierre=?, conv_status='avanzado' WHERE id=?",
+                 (deadline, deadline, d["id"]))
+    _notify_phase(conn, d, f"La votación de «{d['title']}» está abierta: elige entre las propuestas expertas "
+                           f"o «{NONE_OPTION}».")
+    return True
+
+
+def _auto_ballot(conn, d, deadline) -> bool:
+    """(Compat.) Papeleta automática = propuestas expertas. Sin commit."""
+    return _open_vote(conn, d, deadline)
+
+
+def _phase_apply(conn, did) -> None:
+    """Avance PEREZOSO de fases vencidas. Cada transición se hace en su propia
+    transacción con la fila del asunto bloqueada y un UPDATE condicional, de modo
+    que solo ocurre una vez aunque lleguen lecturas concurrentes. Encadena las
+    fases vencidas (p. ej. deliberar→proponer→votar→publicar) en una sola llamada."""
+    for _ in range(10):
+        d = _row(conn, did)
+        if not d or not _phase_due(d):
+            return
+        db.lock_row(conn, "debates", did)
+        d = _row(conn, did)                      # relee con la fila bloqueada
+        if not d or not _phase_due(d):
+            conn.commit(); continue
+        ph, now, dl = d["phase"], db.now(), d.get("phase_deadline")
+        if dl is None:
+            # Asunto previo a los plazos por fase: se fija el plazo en su 1ª lectura.
+            if ph == "votar":
+                c = d.get("cierre")
+                new = float(c) if (c is not None and float(c) > now) else now + VOTACION_DIAS * 86400
+            else:
+                new = now + PHASE_DIAS[ph] * 86400
+            cur = conn.execute("UPDATE debates SET phase_deadline=? WHERE id=? AND phase=? AND phase_deadline IS NULL",
+                               (new, did, ph))
+            if cur.rowcount != 0 and ph == "votar" and not _latest_election(conn, did):
+                _open_vote(conn, d, new)         # 'votar' sin elección (legado): papeleta si hay propuestas expertas
+            conn.commit(); continue
+        dl = float(dl)
+        if ph == "deliberar":
+            cur = conn.execute("UPDATE debates SET phase='proponer', phase_deadline=? "
+                               "WHERE id=? AND phase='deliberar' AND phase_deadline=?",
+                               (dl + PROP_DIAS * 86400, did, d["phase_deadline"]))
+            if cur.rowcount != 0:
+                _on_proponer(conn, d)
+            conn.commit(); continue
+        if ph == "proponer":
+            eprops = _expert_proposals(conn, did)
+            if not eprops:
+                n_auto = conn.execute("SELECT COUNT(*) AS n FROM phase_extensions WHERE debate_id=? AND phase='proponer' AND auto=1",
+                                      (did,)).fetchone()
+                if int(dict(n_auto)["n"]) == 0:
+                    new = dl + PROP_EXT_DIAS * 86400
+                    cur = conn.execute("UPDATE debates SET phase_deadline=? WHERE id=? AND phase='proponer' AND phase_deadline=?",
+                                       (new, did, d["phase_deadline"]))
+                    if cur.rowcount != 0:
+                        conn.execute("INSERT INTO phase_extensions(debate_id,phase,days,justification,user_id,auto,"
+                                     "old_deadline,new_deadline,created) VALUES(?,?,?,?,NULL,1,?,?,?)",
+                                     (did, "proponer", PROP_EXT_DIAS,
+                                      "Ampliación automática: no se publicó ninguna propuesta experta en plazo.", dl, new, now))
+                        _notify_phase(conn, d, f"«{d['title']}» no tiene propuestas expertas: el plazo de Propuestas "
+                                               f"se amplía {PROP_EXT_DIAS} días.", admins=True, experts=True,
+                                      email_subject=f"[Sfera Civitas] Faltan propuestas expertas: «{d['title']}»")
+                    conn.commit(); continue
+                cur = conn.execute("UPDATE debates SET conv_status='sin_propuestas_expertas' WHERE id=? AND phase='proponer' "
+                                   "AND COALESCE(conv_status,'') NOT IN ('sin_propuestas_expertas','sin_propuestas')", (did,))
+                if cur.rowcount != 0:
+                    _notify_phase(conn, d, f"«{d['title']}» se detiene: no se publicó ninguna propuesta experta tras la ampliación.",
+                                  admins=True, experts=True,
+                                  email_subject=f"[Sfera Civitas] Asunto detenido sin propuestas expertas: «{d['title']}»")
+                conn.commit(); return
+            new = dl + VOTACION_DIAS * 86400
+            cur = conn.execute("UPDATE debates SET phase='votar', phase_deadline=?, cierre=? "
+                               "WHERE id=? AND phase='proponer' AND phase_deadline=?",
+                               (new, new, did, d["phase_deadline"]))
+            if cur.rowcount != 0:
+                _create_election(conn, did, d["title"], _ballot_options(eprops))
+                _notify_phase(conn, d, f"La votación de «{d['title']}» está abierta: elige entre las propuestas expertas "
+                                       f"o «{NONE_OPTION}».")
+            conn.commit(); continue
+        if ph == "votar":
+            e = _open_election_row(conn, did)
+            if e:
+                db.lock_row(conn, "elections", e["id"])
+                e = _open_election_row(conn, did)
+                if e:
+                    _tally_close(conn, e)
+                    _notify_phase(conn, d, f"Resultado publicado: «{d['title']}».")
+                conn.commit(); continue
+            if _latest_election(conn, did):      # ya cerrada por otra vía: solo falta la fase
+                conn.execute("UPDATE debates SET phase='publicar', phase_deadline=NULL WHERE id=? AND phase='votar'", (did,))
+                conn.commit(); continue
+            # 'votar' sin elección (legado): papeleta de propuestas expertas si las hay; si no, espera al admin.
+            if _open_vote(conn, d, now + VOTACION_DIAS * 86400):
+                conn.commit(); continue
+            conn.commit(); return
+        conn.commit(); return
+
+
+
+def _refresh(conn, d) -> dict:
+    """Aplica convocatoria + avance de fases y devuelve la fila actualizada con
+    los campos derivados (conv_*, phase_deadline, phase_dias_restantes)."""
+    d = dict(d)
+    did = d["id"]
+    conv = _conv_apply(conn, d)
+    changed = conv["phase"] != d.get("phase")
+    if changed:
+        d = _row(conn, did) or d
+    if _phase_due(d):
+        _phase_apply(conn, did)
+        d = _row(conn, did) or d
+        changed = True
+    if changed:
+        conv = _conv_apply(conn, d)
+    d.update(conv)
+    d.update(_phase_info(d))
+    return d
+
+
+def _safe_refresh(conn, d) -> dict:
+    """Como _refresh, pero un fallo en una transición nunca rompe un LISTADO:
+    se deshace y se devuelve la fila tal cual (se reintentará en la próxima lectura)."""
+    try:
+        return _refresh(conn, d)
+    except Exception as ex:  # pragma: no cover (defensivo)
+        try: conn._raw.rollback()
+        except Exception: pass
+        print(f"[sfera] avance de fase fallido en asunto {_get(d, 'id')}: {ex}")
+        out = dict(d); out.update(_phase_info(out))
+        return out
+
+
+def _load_debate(conn, did, user=None, uid=None):
+    """Asunto existente y accesible (privado: solo su censo), ya puesto al día."""
+    d = _row(conn, did)
+    if not d:
+        raise SferaError(404, "Este asunto no existe")
+    oid = d.get("org_id")
+    who = uid if uid is not None else (user["id"] if user else None)
+    if oid and not (who and _is_org_member(conn, oid, who)):
+        raise SferaError(403, "Asunto privado: solo para miembros de la organización")
+    return _refresh(conn, d)
+
+
+_PHASE_MSG = {
+    "deliberar": ("La deliberación de este asunto aún no se ha abierto",
+                  "La deliberación de este asunto está cerrada"),
+    "proponer": ("La fase de propuestas de este asunto aún no se ha abierto",
+                 "La fase de propuestas de este asunto está cerrada"),
+    "votar": ("La votación de este asunto aún no se ha abierto",
+              "La votación de este asunto está cerrada"),
+}
+
+
+def _require_phase(d, phase):
+    cur = d.get("phase")
+    if cur == phase and not _stopped(d):
+        return
+    antes, despues = _PHASE_MSG[phase]
+    ci = PHASES.index(cur) if cur in PHASES else 0
+    raise SferaError(409, antes if ci < PHASES.index(phase) else despues)
+
+
+def _visible_debate(conn, did, user=None):
+    """Lectura de un asunto: existe, no está oculto por moderación (salvo para
+    moderadores) y, si es privado, solo para su censo. Devuelve la fila."""
+    import moderation
+    d = conn.execute("SELECT * FROM debates WHERE id=?", (did,)).fetchone()
+    if not d:
+        raise SferaError(404, "No existe")
+    # MODERACIÓN: un asunto oculto (denuncias/moderador) solo lo ven los moderadores.
+    if did in moderation.hidden_ids(conn, "debate") and not moderation.can_moderate(conn, user):
+        raise SferaError(404, "Este asunto está oculto, pendiente de revisión de moderación")
+    # Asuntos PRIVADOS: solo visibles para el censo de su organización.
+    oid = d["org_id"] if "org_id" in d.keys() else None
+    if oid and not (user and _is_org_member(conn, oid, user["id"])):
+        raise SferaError(403, "Asunto privado: solo para miembros de la organización")
+    return d
+
+
+# ── LISTADOS PAGINADOS (miles de aportaciones) ────────────────────────────────
+# Orden, filtro y paginación en SQL. Se excluye lo oculto por moderación y lo
+# escrito por usuarios que quien mira ha bloqueado. «Útil»: una marca por persona.
+ARG_SORTS = ("utiles", "recientes")
+PROP_SORTS = ("apoyos", "utiles", "recientes")
+STANCES = ("favor", "contra", "matiz")
+
+
+def _page(limit, offset):
+    try:
+        limit = int(limit)
+    except Exception:
+        limit = 20
+    try:
+        offset = int(offset)
+    except Exception:
+        offset = 0
+    return max(1, min(PAGE_MAX, limit)), max(0, offset)
+
+
+def _mod_filter(alias, ttype, user):
+    import moderation
+    hs = moderation.HIDDEN_STATES
+    sql = (f" AND NOT EXISTS (SELECT 1 FROM content_moderation m WHERE m.target_type=? AND m.target_id={alias}.id "
+           f"AND m.status IN ({','.join('?' * len(hs))}))")
+    params = [ttype, *hs]
+    if user:
+        sql += f" AND {alias}.user_id NOT IN (SELECT blocked_id FROM user_blocks WHERE blocker_id=?)"
+        params.append(user["id"])
+    return sql, params
+
+
+def _mine(conn, table, col, user, ids) -> set:
+    if not user or not ids:
+        return set()
+    q = f"SELECT {col} AS i FROM {table} WHERE user_id=? AND {col} IN ({','.join('?' * len(ids))})"
+    return {int(dict(r)["i"]) for r in conn.execute(q, (user["id"], *ids)).fetchall()}
+
+
+def _norm_stance(s):
+    return s if s in STANCES else "matiz"
+
+
+def _list_arguments(conn, did, user=None, sort="utiles", stance=None, limit=20, offset=0) -> dict:
+    sort = sort if sort in ARG_SORTS else "utiles"
+    stance = stance if stance in STANCES else None
+    limit, offset = _page(limit, offset)
+    fsql, fp = _mod_filter("a", "argument", user)
+    counts = {s: 0 for s in STANCES}
+    for r in conn.execute(f"SELECT a.stance AS stance, COUNT(*) AS n FROM arguments a WHERE a.debate_id=?{fsql} "
+                          "GROUP BY a.stance", (did, *fp)).fetchall():
+        r = dict(r); counts[_norm_stance(r["stance"])] += int(r["n"])
+    counts["todos"] = sum(counts[s] for s in STANCES)
+    if stance == "matiz":      # los valores antiguos/no reconocidos cuentan como «matiz»
+        ssql, sp = " AND (a.stance IS NULL OR a.stance NOT IN ('favor','contra'))", []
+    elif stance:
+        ssql, sp = " AND a.stance=?", [stance]
+    else:
+        ssql, sp = "", []
+    order = "utiles DESC, a.id ASC" if sort == "utiles" else "a.id DESC"
+    rows = conn.execute(
+        "SELECT a.id AS id, a.debate_id AS debate_id, a.user_id AS user_id, a.stance AS stance, a.text AS text, "
+        "a.created AS created, (SELECT COUNT(*) FROM argument_utiles u WHERE u.argument_id=a.id) AS utiles "
+        f"FROM arguments a WHERE a.debate_id=?{fsql}{ssql} ORDER BY {order} LIMIT ? OFFSET ?",
+        (did, *fp, *sp, limit, offset)).fetchall()
+    items = [dict(r) for r in rows]
+    mine = _mine(conn, "argument_utiles", "argument_id", user, [int(i["id"]) for i in items])
+    for it in items:
+        it["stance"] = _norm_stance(it["stance"])
+        it["utiles"] = int(it["utiles"] or 0)
+        it["util_by_me"] = int(it["id"]) in mine
+    total = counts[stance] if stance else counts["todos"]
+    return {"items": items, "total": total, "counts": counts, "sort": sort, "stance": stance or "todos",
+            "limit": limit, "offset": offset, "has_more": offset + len(items) < total}
+
+
+def _list_proposals(conn, did, user=None, sort="apoyos", limit=20, offset=0) -> dict:
+    sort = sort if sort in PROP_SORTS else "apoyos"
+    limit, offset = _page(limit, offset)
+    fsql, fp = _mod_filter("p", "proposal", user)
+    n = conn.execute(f"SELECT COUNT(*) AS n FROM proposals p WHERE p.debate_id=?{fsql}", (did, *fp)).fetchone()
+    total = int(dict(n)["n"]) if n else 0
+    order = {"apoyos": "supports DESC, utiles DESC, p.id ASC",
+             "utiles": "utiles DESC, supports DESC, p.id ASC",
+             "recientes": "p.id DESC"}[sort]
+    rows = conn.execute(
+        "SELECT p.id AS id, p.debate_id AS debate_id, p.user_id AS user_id, p.text AS text, p.created AS created, "
+        "(SELECT COUNT(*) FROM proposal_supports s WHERE s.proposal_id=p.id) AS supports, "
+        "(SELECT COUNT(*) FROM proposal_utiles u WHERE u.proposal_id=p.id) AS utiles "
+        f"FROM proposals p WHERE p.debate_id=?{fsql} ORDER BY {order} LIMIT ? OFFSET ?",
+        (did, *fp, limit, offset)).fetchall()
+    items = [dict(r) for r in rows]
+    ids = [int(i["id"]) for i in items]
+    sup = _mine(conn, "proposal_supports", "proposal_id", user, ids)
+    ut = _mine(conn, "proposal_utiles", "proposal_id", user, ids)
+    for it in items:
+        it["supports"] = int(it["supports"] or 0)
+        it["utiles"] = int(it["utiles"] or 0)
+        it["supported_by_me"] = int(it["id"]) in sup
+        it["util_by_me"] = int(it["id"]) in ut
+        it["en_papeleta"] = False        # las propuestas ciudadanas NO se votan (compat. con la web anterior)
+    return {"items": items, "total": total, "sort": sort, "limit": limit, "offset": offset,
+            "has_more": offset + len(items) < total}
+
+
+def list_arguments(did: int, user=None, sort="utiles", stance=None, limit=20, offset=0) -> dict:
+    """PÚBLICO: argumentos de un asunto, paginados. sort=utiles|recientes;
+    stance=favor|contra|matiz (vacío = todos). Devuelve items, total y recuento por postura."""
     with db.session() as conn:
-        d = conn.execute("SELECT * FROM debates WHERE id=?", (did,)).fetchone()
-        if not d:
-            raise SferaError(404, "No existe")
-        # MODERACIÓN: un asunto oculto (denuncias/moderador) solo lo ven los moderadores.
-        if did in moderation.hidden_ids(conn, "debate") and not moderation.can_moderate(conn, user):
-            raise SferaError(404, "Este asunto está oculto, pendiente de revisión de moderación")
-        # Asuntos PRIVADOS: solo visibles para el censo de su organización.
-        oid = d["org_id"] if "org_id" in d.keys() else None
-        if oid and not (user and _is_org_member(conn, oid, user["id"])):
-            raise SferaError(403, "Asunto privado: solo para miembros de la organización")
-        args = [dict(r) for r in conn.execute("SELECT * FROM arguments WHERE debate_id=? ORDER BY id", (did,)).fetchall()]
-        props = [dict(r) for r in conn.execute("SELECT * FROM proposals WHERE debate_id=? ORDER BY id", (did,)).fetchall()]
-        # MODERACIÓN: fuera lo oculto por denuncias y lo de usuarios bloqueados por quien mira.
-        args = moderation.filter_items(conn, args, "argument", user)
-        props = moderation.filter_items(conn, props, "proposal", user)
-        elec = conn.execute("SELECT id,question,options_json,status FROM elections WHERE debate_id=? ORDER BY id DESC", (did,)).fetchone()
-        out = dict(d)
-        out.update(_conv_apply(conn, d))   # estado de convocatoria (doble vía) + avance/caducidad
-    out["arguments"] = args
-    out["proposals"] = props
-    out["election"] = dict(elec) if elec else None
+        _visible_debate(conn, did, user)
+        return _list_arguments(conn, did, user, sort, stance, limit, offset)
+
+
+def list_proposals(did: int, user=None, sort="apoyos", limit=20, offset=0) -> dict:
+    """PÚBLICO: propuestas CIUDADANAS de un asunto, paginadas. sort=apoyos|utiles|recientes."""
+    with db.session() as conn:
+        _visible_debate(conn, did, user)
+        return _list_proposals(conn, did, user, sort, limit, offset)
+
+
+_ROLE_LABEL = {"admin": "Administración del asunto", "experto": "Experto/a del asunto"}
+
+
+def _public_eprop(p) -> dict:
+    role = p.get("author_role") or "experto"
+    return {"id": p["id"], "title": p["title"], "text": p["text"], "justification": p.get("justification") or "",
+            "author_id": p.get("author_id"), "author_role": role,
+            "author_label": _ROLE_LABEL.get(role, _ROLE_LABEL["experto"]), "created": p.get("created")}
+
+
+def list_expert_proposals(did: int, user=None) -> dict:
+    with db.session() as conn:
+        _visible_debate(conn, did, user)
+        eps = _expert_proposals(conn, did)
+    return {"items": [_public_eprop(p) for p in eps], "max": EXPERT_MAX}
+
+
+def get_debate(did: int, user=None) -> dict:
+    """Ficha del asunto. ESCALA: ya no incrusta listas sin límite.
+    · `arguments`: top-EMBED_MAX por «útil» (antes: todos). Total y recuento por postura
+      en `arguments_total` / `arguments_counts`; el resto, en GET /debates/{id}/arguments.
+    · `proposals`: top-EMBED_MAX propuestas ciudadanas por apoyos (antes: todas). Total
+      en `proposals_total`; el resto, en GET /debates/{id}/proposals.
+    · `expert_proposals`: todas (máx. EXPERT_MAX) — son las que se votan.
+    La web anterior sigue funcionando (mismas claves, listas acotadas)."""
+    import roles
+    with db.session() as conn:
+        d = _visible_debate(conn, did, user)
+        out = _safe_refresh(conn, d)   # convocatoria (doble vía) + avance perezoso de fases
+        A = _list_arguments(conn, did, user, "utiles", None, EMBED_MAX, 0)
+        P = _list_proposals(conn, did, user, "apoyos", EMBED_MAX, 0)
+        eps = _expert_proposals(conn, did)
+        elec = conn.execute("SELECT id,question,options_json,status,result_json FROM elections WHERE debate_id=? ORDER BY id DESC", (did,)).fetchone()
+        n_votos = None
+        if elec:
+            nv = conn.execute("SELECT COUNT(*) AS n FROM bulletin_board WHERE election_id=? AND kind='ballot'",
+                              (dict(elec)["id"],)).fetchone()
+            n_votos = int(dict(nv)["n"]) if nv else 0
+        exts = [dict(r) for r in conn.execute(
+            "SELECT phase,days,justification,auto,old_deadline,new_deadline,created FROM phase_extensions "
+            "WHERE debate_id=? ORDER BY id", (did,)).fetchall()]
+        drow = _row(conn, did)
+        can_adm = bool(user) and roles.can_admin(conn, user, drow)
+        can_auth = bool(user) and roles.can_author(conn, user, drow)
+    out["arguments"] = A["items"]
+    out["arguments_total"] = A["total"]
+    out["arguments_counts"] = A["counts"]
+    out["proposals"] = P["items"]
+    out["proposals_total"] = P["total"]
+    out["expert_proposals"] = [_public_eprop(p) for p in eps]
+    out["expert_proposals_max"] = EXPERT_MAX
+    out["embed_max"] = EMBED_MAX
+    if elec:
+        e = dict(elec)
+        rj = e.pop("result_json", None)
+        e["options"] = json.loads(e["options_json"]) if e.get("options_json") else []
+        e["result"] = json.loads(rj) if rj else None
+        e["n_votos"] = n_votos
+        out["election"] = e
+    else:
+        out["election"] = None
+    out["extensions"] = exts
+    out["can_admin"] = can_adm
+    out["can_author"] = can_auth        # experto del asunto (o admin): puede publicar propuestas expertas
+    out["phase_rules"] = {"delib_dias": DELIB_DIAS, "prop_dias": PROP_DIAS, "prop_ext_dias": PROP_EXT_DIAS,
+                          "votacion_dias": VOTACION_DIAS, "ballot_max": BALLOT_MAX, "expert_max": EXPERT_MAX,
+                          "ballot_source": "expertas", "none_option": NONE_OPTION, "embed_max": EMBED_MAX}
     return out
 
 
 def set_phase(did: int, phase: str, user) -> dict:
+    """Avance MANUAL de fase (solo admin del asunto). Solo hacia delante; aplica
+    los mismos efectos que el avance automático (plazos, papeleta, recuento).
+    A 'votar' solo se pasa con al menos UNA propuesta experta."""
     import roles
     if phase not in PHASES:
         raise SferaError(400, "Fase inválida")
     with db.session() as conn:
-        d = conn.execute("SELECT * FROM debates WHERE id=?", (did,)).fetchone()
+        d = _row(conn, did)
         if not d:
             raise SferaError(404, "No existe")
         if not roles.can_admin(conn, user, d):
             raise SferaError(403, "No tienes permiso de administración en este asunto")
-        if phase == "votar":
-            # Al abrir votación se fija una fecha de cierre (ventana estándar de 14 días).
-            conn.execute("UPDATE debates SET phase=?, cierre=? WHERE id=?",
-                         (phase, db.now() + VOTACION_DIAS * 86400, did))
-        else:
-            conn.execute("UPDATE debates SET phase=? WHERE id=?", (phase, did))
+        d = _refresh(conn, d)
+        cur_ph = d["phase"]
+        if PHASES.index(phase) <= PHASES.index(cur_ph):
+            raise SferaError(409, f"Solo se puede avanzar a una fase posterior (la fase actual es «{cur_ph}»)")
+        db.lock_row(conn, "debates", did)
+        d = _row(conn, did)
+        if d["phase"] != cur_ph:
+            raise SferaError(409, "La fase de este asunto acaba de cambiar; recarga e inténtalo de nuevo")
+        now = db.now()
+        if phase in ("deliberar", "proponer"):
+            conn.execute("UPDATE debates SET phase=?, conv_status='avanzado', phase_deadline=? WHERE id=?",
+                         (phase, now + PHASE_DIAS[phase] * 86400, did))
+        elif phase == "votar":
+            if not _open_election_row(conn, did):
+                if not _open_vote(conn, d, now + VOTACION_DIAS * 86400):
+                    raise SferaError(409, "No hay propuestas expertas para formar la papeleta: los expertos del asunto "
+                                          "deben publicar al menos una en la fase de Propuestas.")
+            else:   # legado: ya había una votación abierta
+                dl = float(d["cierre"]) if d.get("cierre") is not None and float(d["cierre"]) > now else now + VOTACION_DIAS * 86400
+                conn.execute("UPDATE debates SET phase='votar', conv_status='avanzado', phase_deadline=?, cierre=? WHERE id=?",
+                             (dl, dl, did))
+        else:  # publicar
+            e = _open_election_row(conn, did)
+            if e:
+                db.lock_row(conn, "elections", e["id"])
+                _tally_close(conn, e)
+            conn.execute("UPDATE debates SET phase='publicar', phase_deadline=NULL WHERE id=?", (did,))
+        _lbl = {"deliberar": "Deliberación", "proponer": "Propuestas", "votar": "Votación", "publicar": "Publicado"}[phase]
+        _notify_phase(conn, d, f"«{d['title']}» pasa a la fase de {_lbl} (decisión de administración).")
+        if phase == "proponer":
+            _notify_phase(conn, d, f"«{d['title']}» está en Propuestas: como experto/a ya puedes publicar las "
+                                   f"propuestas expertas que se votarán (máx. {EXPERT_MAX}).", experts=True, creator=False)
         conn.commit()
-    return {"phase": phase}
+        d = _refresh(conn, _row(conn, did))
+    return {"phase": d["phase"], "phase_deadline": d.get("phase_deadline"),
+            "phase_dias_restantes": d.get("phase_dias_restantes")}
+
+
+def extend_phase(did: int, days, justification: str, user) -> dict:
+    """Amplía el plazo de la fase ACTUAL N días (solo admin) con justificación
+    obligatoria, que queda registrada y se muestra públicamente en el asunto.
+    Reactiva un asunto detenido por falta de propuestas (expertas)."""
+    import roles
+    try:
+        days = int(days)
+    except Exception:
+        raise SferaError(400, "Indica un número de días válido")
+    if days < 1 or days > EXT_MAX_DIAS:
+        raise SferaError(400, f"Los días de ampliación deben estar entre 1 y {EXT_MAX_DIAS}")
+    justification = (justification or "").strip()
+    if len(justification) < 10:
+        raise SferaError(400, "Explica el motivo de la ampliación (mínimo 10 caracteres)")
+    justification = justification[:1000]
+    with db.session() as conn:
+        d = _row(conn, did)
+        if not d:
+            raise SferaError(404, "No existe")
+        if not roles.can_admin(conn, user, d):
+            raise SferaError(403, "No tienes permiso de administración en este asunto")
+        _refresh(conn, d)                        # primero, ponerlo al día (puede cambiar de fase)
+        db.lock_row(conn, "debates", did)
+        d = _row(conn, did)                      # fila bloqueada
+        ph, now = d["phase"], db.now()
+        if ph == "publicar":
+            raise SferaError(409, "Un asunto publicado no tiene plazo que ampliar")
+        if ph == "convocar":
+            old = d.get("conv_deadline")
+            new = max(float(old) if old is not None else now, now) + days * 86400
+            conn.execute("UPDATE debates SET conv_deadline=?, conv_status=CASE WHEN conv_status='caducado' "
+                         "THEN 'recabando' ELSE conv_status END WHERE id=?", (new, did))
+        else:
+            if ph == "votar" and not _open_election_row(conn, did):
+                raise SferaError(409, "No hay una votación abierta que ampliar")
+            old = d.get("phase_deadline")
+            new = max(float(old) if old is not None else now, now) + days * 86400
+            if ph == "votar":
+                conn.execute("UPDATE debates SET phase_deadline=?, cierre=? WHERE id=?", (new, new, did))
+            else:
+                conn.execute("UPDATE debates SET phase_deadline=?, conv_status=CASE WHEN conv_status IN "
+                             "('sin_propuestas','sin_propuestas_expertas') THEN 'avanzado' ELSE conv_status END "
+                             "WHERE id=?", (new, did))
+        conn.execute("INSERT INTO phase_extensions(debate_id,phase,days,justification,user_id,auto,old_deadline,new_deadline,created) "
+                     "VALUES(?,?,?,?,?,0,?,?,?)", (did, ph, days, justification, user["id"], old, new, now))
+        _notify_phase(conn, d, f"Se amplía {days} día(s) el plazo de «{d['title']}»: {justification}",
+                      experts=(ph == "proponer"))
+        conn.commit()
+        d = _refresh(conn, _row(conn, did))
+    return {"phase": d["phase"], "phase_deadline": d.get("phase_deadline"),
+            "phase_dias_restantes": d.get("phase_dias_restantes"), "days": days}
 
 
 def add_argument(did, uid, stance, text) -> dict:
+    """Solo en DELIBERAR."""
+    text = (text or "").strip()
+    if not text:
+        raise SferaError(400, "Escribe tu argumento")
+    if stance not in ("favor", "contra", "matiz"):
+        stance = "matiz"
     with db.session() as conn:
-        conn.execute("INSERT INTO arguments(debate_id,user_id,stance,text,created) VALUES(?,?,?,?,?)",
-                     (did, uid, stance, text, db.now()))
+        d = _load_debate(conn, did, uid=uid)
+        _require_phase(d, "deliberar")
+        cur = conn.execute("INSERT INTO arguments(debate_id,user_id,stance,text,created) VALUES(?,?,?,?,?)",
+                           (did, uid, stance, text[:5000], db.now()), returning=True)
         conn.commit()
-    return {"ok": True}
+    return {"ok": True, "id": cur.lastrowid}
 
 
 def add_proposal(did, uid, text) -> dict:
+    """Propuesta CIUDADANA (insumo para los expertos; no se vota). Solo en PROPONER."""
+    text = (text or "").strip()
+    if not text:
+        raise SferaError(400, "Escribe tu propuesta")
     with db.session() as conn:
-        conn.execute("INSERT INTO proposals(debate_id,user_id,text,created) VALUES(?,?,?,?)", (did, uid, text, db.now()))
+        d = _load_debate(conn, did, uid=uid)
+        _require_phase(d, "proponer")
+        cur = conn.execute("INSERT INTO proposals(debate_id,user_id,text,created) VALUES(?,?,?,?)",
+                           (did, uid, text[:2000], db.now()), returning=True)
         conn.commit()
-    return {"ok": True}
+    return {"ok": True, "id": cur.lastrowid}
+
+
+def support_proposal(pid: int, user) -> dict:
+    """Apoyar una propuesta ciudadana (solo en PROPONER). Un apoyo por persona y propuesta."""
+    import moderation
+    with db.session() as conn:
+        p = conn.execute("SELECT * FROM proposals WHERE id=?", (pid,)).fetchone()
+        if not p or int(pid) in moderation.hidden_ids(conn, "proposal"):
+            raise SferaError(404, "Propuesta no encontrada")
+        p = dict(p)
+        d = _load_debate(conn, p["debate_id"], user=user)
+        _require_phase(d, "proponer")
+        already = conn.execute("SELECT 1 FROM proposal_supports WHERE proposal_id=? AND user_id=?",
+                               (pid, user["id"])).fetchone()
+        if not already:
+            try:
+                conn.execute("INSERT INTO proposal_supports(proposal_id,user_id,created) VALUES(?,?,?)",
+                             (pid, user["id"], db.now()))
+                conn.commit()
+            except db.INTEGRITY_ERRORS:      # doble clic concurrente: ya contaba
+                try: conn._raw.rollback()
+                except Exception: pass
+                already = True
+        n = conn.execute("SELECT COUNT(*) AS n FROM proposal_supports WHERE proposal_id=?", (pid,)).fetchone()
+    return {"ok": True, "already": bool(already), "supports": int(dict(n)["n"]), "supported_by_me": True}
+
+
+# «Útil»: (tabla del contenido, tabla de marcas, columna, fase en la que se puede marcar, texto 404)
+_UTIL = {"argument": ("arguments", "argument_utiles", "argument_id", "deliberar", "Argumento no encontrado"),
+         "proposal": ("proposals", "proposal_utiles", "proposal_id", "proponer", "Propuesta no encontrada")}
+
+
+def toggle_util(kind: str, item_id: int, user, on=None) -> dict:
+    """Marca/desmarca «Útil» un argumento (en Deliberar) o una propuesta ciudadana
+    (en Proponer). Una marca por persona y aportación. on=None alterna; True/False fija."""
+    import moderation
+    if kind not in _UTIL:
+        raise SferaError(400, "Tipo de contenido no válido")
+    table, utable, col, phase, nf = _UTIL[kind]
+    with db.session() as conn:
+        row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (item_id,)).fetchone()
+        if not row or int(item_id) in moderation.hidden_ids(conn, kind):
+            raise SferaError(404, nf)
+        d = _load_debate(conn, dict(row)["debate_id"], user=user)
+        _require_phase(d, phase)
+        exists = bool(conn.execute(f"SELECT 1 FROM {utable} WHERE {col}=? AND user_id=?",
+                                   (item_id, user["id"])).fetchone())
+        want = (not exists) if on is None else bool(on)
+        if want and not exists:
+            try:
+                conn.execute(f"INSERT INTO {utable}({col},user_id,created) VALUES(?,?,?)", (item_id, user["id"], db.now()))
+                conn.commit()
+            except db.INTEGRITY_ERRORS:      # doble clic concurrente: ya estaba marcada
+                try: conn._raw.rollback()
+                except Exception: pass
+        elif not want and exists:
+            conn.execute(f"DELETE FROM {utable} WHERE {col}=? AND user_id=?", (item_id, user["id"]))
+            conn.commit()
+        n = conn.execute(f"SELECT COUNT(*) AS n FROM {utable} WHERE {col}=?", (item_id,)).fetchone()
+    return {"ok": True, "id": int(item_id), "utiles": int(dict(n)["n"]), "util_by_me": want}
+
+
+def add_expert_proposal(did: int, user, title: str, text: str, justification: str = "") -> dict:
+    """PROPUESTA EXPERTA (la que se vota). Solo expertos del asunto o su admin, solo
+    en PROPONER (también si quedó detenido sin propuestas expertas, para poder
+    reactivarlo), máximo EXPERT_MAX por asunto y títulos distintos."""
+    import roles
+    title = " ".join((title or "").split())
+    text = (text or "").strip()
+    justification = (justification or "").strip()
+    with db.session() as conn:
+        d = _load_debate(conn, did, user=user)
+        drow = _row(conn, did)
+        if not roles.can_author(conn, user, drow):
+            raise SferaError(403, "Solo los expertos asignados a este asunto (o su administración) pueden publicar propuestas expertas")
+        if d.get("phase") != "proponer":
+            _require_phase(d, "proponer")
+        if not title:
+            raise SferaError(400, "Ponle un título a la propuesta experta (será la opción de la papeleta)")
+        if len(title) > 160:
+            raise SferaError(400, "El título no puede superar 160 caracteres")
+        if not text:
+            raise SferaError(400, "Escribe el texto de la propuesta experta")
+        if title.lower() == NONE_OPTION.lower():
+            raise SferaError(400, "Ese título está reservado para la opción «Ninguna / mantener como está»")
+        db.lock_row(conn, "debates", did)
+        eps = _expert_proposals(conn, did)
+        if len(eps) >= EXPERT_MAX:
+            raise SferaError(409, f"Este asunto ya tiene el máximo de {EXPERT_MAX} propuestas expertas")
+        if any((e["title"] or "").strip().lower() == title.lower() for e in eps):
+            raise SferaError(409, "Ya hay una propuesta experta con ese título")
+        # Etiqueta pública: quien está ASIGNADO como experto (o tiene rol de experto en el
+        # ámbito) firma como «experto/a»; un admin que no es experto, como «administración».
+        is_exp = bool(conn.execute("SELECT 1 FROM debate_experts WHERE debate_id=? AND user_id=?",
+                                   (did, user["id"])).fetchone()) or any(
+            g["role"] == "expert" and roles._matches(g["scope_type"], g["scope_value"], drow)
+            for g in roles._grants(conn, user["id"]))
+        role = "experto" if is_exp else ("admin" if roles.can_admin(conn, user, drow) else "experto")
+        cur = conn.execute("INSERT INTO expert_proposals(debate_id,author_id,author_role,title,text,justification,created,hidden) "
+                           "VALUES(?,?,?,?,?,?,?,0)",
+                           (did, user["id"], role, title, text[:5000], justification[:3000] or None, db.now()), returning=True)
+        if _stopped(d):
+            _notify_phase(conn, d, f"«{d['title']}» ya tiene una propuesta experta: la administración puede abrir la "
+                                   f"votación o ampliar el plazo.", admins=True, creator=False)
+        conn.commit()
+    return {"ok": True, "id": cur.lastrowid, "author_role": role, "count": len(eps) + 1, "max": EXPERT_MAX}
+
+
+def withdraw_expert_proposal(epid: int, user) -> dict:
+    """Retirar una propuesta experta (su autor o el admin del asunto), solo en PROPONER."""
+    import roles
+    with db.session() as conn:
+        p = conn.execute("SELECT * FROM expert_proposals WHERE id=?", (epid,)).fetchone()
+        if not p or int(dict(p).get("hidden") or 0):
+            raise SferaError(404, "Propuesta experta no encontrada")
+        p = dict(p)
+        d = _load_debate(conn, p["debate_id"], user=user)
+        if not (int(p["author_id"]) == int(user["id"]) or roles.can_admin(conn, user, _row(conn, p["debate_id"]))):
+            raise SferaError(403, "Solo su autor o la administración del asunto pueden retirarla")
+        if d.get("phase") != "proponer":
+            _require_phase(d, "proponer")
+        conn.execute("UPDATE expert_proposals SET hidden=1 WHERE id=?", (epid,))
+        conn.commit()
+    return {"ok": True, "id": int(epid)}
 
 
 # ── Voto ─────────────────────────────────────────────────────────────────────
 def open_election(did, question, options, user, n_trustees: int = 3) -> dict:
+    """Apertura MANUAL (admin). DECISIÓN DEL FUNDADOR: solo se votan propuestas
+    expertas, así que la papeleta se forma SIEMPRE con ellas + «Ninguna / mantener
+    como está»; `options` se ignora (se mantiene en la API por compatibilidad con la
+    web anterior). Solo la pregunta puede personalizarse."""
     import roles
-    if len(options) < 2:
-        raise SferaError(400, "Mínimo 2 opciones")
     with db.session() as conn:
-        d = conn.execute("SELECT * FROM debates WHERE id=?", (did,)).fetchone()
+        d = _row(conn, did)
         if not d:
             raise SferaError(404, "Asunto no existe")
         if not roles.can_admin(conn, user, d):
             raise SferaError(403, "No tienes permiso de administración en este asunto")
-    # Custodios DISTRIBUIDOS: clave pública combinada H = Π g^{x_i} (nadie descifra solo)
-    shares, H = zk.gen_trustees(n_trustees)
-    epub = cc.ElgamalPub(cc.P, cc.G, H)
-    # Una clave de firma ciega POR VÍA (open / verified): universos separados.
-    s_open = cc.BlindSigner(2048)
-    s_ver = cc.BlindSigner(2048)
-    with db.session() as conn:
-        cur = conn.execute("""INSERT INTO elections(debate_id,question,options_json,status,elgamal_pub_json,trustees_json,
-                    blind_open_n,blind_open_e,blind_open_d,blind_verified_n,blind_verified_e,blind_verified_d,created)
-                    VALUES(?,?,?,'abierta',?,?,?,?,?,?,?,?,?)""",
-                           (did, question, json.dumps(options),
-                            json.dumps({"p": str(epub.p), "g": str(epub.g), "h": str(epub.h)}),
-                            _enc(json.dumps([str(s.x) for s in shares])),   # shares CIFRADAS en reposo
-                            str(s_open.n), str(s_open.e), _enc(str(s_open.d)),        # d privada CIFRADA
-                            str(s_ver.n), str(s_ver.e), _enc(str(s_ver.d)), db.now()), returning=True)
-        eid = cur.lastrowid
-        payload = json.dumps({"question": question, "options": options, "n_custodios": n_trustees,
-                              "elgamal_pub": {"p": str(epub.p), "g": str(epub.g), "h": str(epub.h)},
-                              "blind_pub": {"open": {"n": str(s_open.n), "e": str(s_open.e)},
-                                            "verified": {"n": str(s_ver.n), "e": str(s_ver.e)}}}, sort_keys=True)
-        entry_hash = cc.chain_hash("GENESIS", payload)
-        conn.execute("INSERT INTO bulletin_board(election_id,seq,kind,via,payload_json,prev_hash,entry_hash,created) VALUES(?,?,?,?,?,?,?,?)",
-                     (eid, 0, "genesis", None, payload, "GENESIS", entry_hash, db.now()))
-        conn.execute("UPDATE debates SET phase='votar', cierre=? WHERE id=?",
-                     (db.now() + VOTACION_DIAS * 86400, did))
+        d = _refresh(conn, d)
+        if d["phase"] == "publicar":
+            raise SferaError(409, "Este asunto ya está publicado: no se puede abrir otra votación")
+        if _open_election_row(conn, did):
+            raise SferaError(409, "Ya hay una votación abierta en este asunto")
+        if d["phase"] not in ("proponer", "votar"):
+            raise SferaError(409, "La votación se abre al terminar la fase de Propuestas")
+        question = (question or "").strip() or d["title"]
+        db.lock_row(conn, "debates", did)
+        if _open_election_row(conn, did):
+            raise SferaError(409, "Ya hay una votación abierta en este asunto")
+        eprops = _expert_proposals(conn, did)
+        if not eprops:
+            raise SferaError(409, "No hay propuestas expertas para formar la papeleta: los expertos del asunto "
+                                  "deben publicar al menos una en la fase de Propuestas.")
+        opts = _ballot_options(eprops)
+        eid = _create_election(conn, did, question, opts, n_trustees)
+        dl = db.now() + VOTACION_DIAS * 86400
+        conn.execute("UPDATE debates SET phase='votar', conv_status='avanzado', cierre=?, phase_deadline=? WHERE id=?",
+                     (dl, dl, did))
         conn.commit()
-    return {"election_id": eid}
+    return {"election_id": eid, "options": opts}
+
 
 
 def election_public(eid: int) -> dict:
@@ -1111,6 +1912,20 @@ def _blind_pub_for(e, via: str) -> cc.BlindPubKey:
     return cc.BlindPubKey(int(e["blind_verified_n"]), int(e["blind_verified_e"]))
 
 
+def _election_gate(conn, eid, user=None):
+    """La elección existe, su asunto está al día (avance perezoso: puede cerrarse
+    aquí si venció) y la votación sigue ABIERTA en fase 'votar'. Devuelve la fila."""
+    e = conn.execute("SELECT * FROM elections WHERE id=?", (eid,)).fetchone()
+    if not e:
+        raise SferaError(404, "Elección no disponible")
+    did = e["debate_id"]
+    d = _load_debate(conn, did, user=user) if user else _refresh(conn, _row(conn, did))
+    e = conn.execute("SELECT * FROM elections WHERE id=?", (eid,)).fetchone()
+    if d.get("phase") != "votar" or e["status"] != "abierta":
+        raise SferaError(409, "La votación de este asunto no está abierta")
+    return e
+
+
 def issue_credential(eid, user, blinded: str, via: str = "open") -> dict:
     """IDENTIDAD: firma a ciegas en la VÍA elegida. Nunca ve el token; solo marca 'emitida'."""
     _via_ok(via)
@@ -1119,9 +1934,7 @@ def issue_credential(eid, user, blinded: str, via: str = "open") -> dict:
     if via == "verified" and user.get("loa") != "verified":
         raise SferaError(403, "Necesitas certificado digital (Cl@ve/DNIe) para la vía verificada")
     with db.session() as conn:
-        e = conn.execute("SELECT * FROM elections WHERE id=?", (eid,)).fetchone()
-        if not e or e["status"] != "abierta":
-            raise SferaError(400, "Elección no disponible")
+        e = _election_gate(conn, eid, user)
         d_enc = e["blind_open_d"] if via == "open" else e["blind_verified_d"]
         n = int(e["blind_open_n"] if via == "open" else e["blind_verified_n"])
         d = int(_dec(d_enc))
@@ -1148,12 +1961,13 @@ def cast_vote(eid, token_hex, sig, ballot, bit_proofs=None, sum_proof=None, via:
     """VOTO: credencial anónima de la VÍA + papeleta cifrada CON PRUEBA ZK + nullifier + tablón."""
     _via_ok(via)
     with db.session() as conn:
+        _election_gate(conn, eid)        # pone el asunto al día (cierre automático si venció)
         # Bloqueo de fila: serializa votos concurrentes de la misma elección
         # (asegura seq consecutivos y cadena de hashes íntegra).
         db.lock_row(conn, "elections", eid)
         e = conn.execute("SELECT * FROM elections WHERE id=?", (eid,)).fetchone()
         if not e or e["status"] != "abierta":
-            raise SferaError(400, "Elección cerrada o inexistente")
+            raise SferaError(409, "La votación de este asunto está cerrada")
         options = json.loads(e["options_json"])
         if len(ballot) != len(options):
             raise SferaError(400, "Papeleta mal formada")
@@ -1202,35 +2016,23 @@ def _tally_via(options, ballots_via, shares, n):
 
 
 def close_election(eid, user) -> dict:
+    """Cierre MANUAL (solo admin): recuento + tablón + publicar."""
     import roles
     with db.session() as conn:
-        db.lock_row(conn, "elections", eid)
         e = conn.execute("SELECT * FROM elections WHERE id=?", (eid,)).fetchone()
         if not e:
             raise SferaError(404, "No existe")
-        d = conn.execute("SELECT * FROM debates WHERE id=?", (e["debate_id"],)).fetchone()
+        did = e["debate_id"]
+        d = _row(conn, did)
         if not roles.can_admin(conn, user, d):
             raise SferaError(403, "No tienes permiso de administración en este asunto")
-        options = json.loads(e["options_json"])
-        rows = conn.execute("SELECT via,payload_json FROM bulletin_board WHERE election_id=? AND kind='ballot' ORDER BY seq", (eid,)).fetchall()
-        shares = [zk.TrusteeShare(x=int(xs), h=pow(cc.G, int(xs), cc.P)) for xs in json.loads(_dec(e["trustees_json"]))]
-        result = {}
-        for via in VIAS:
-            bv = [json.loads(r["payload_json"])["ballot"] for r in rows if r["via"] == via]
-            totals = _tally_via(options, bv, shares, len(bv))
-            result[via] = {"total_votos": len(bv), "opciones": options, "recuento": totals,
-                           "umbral_convocatoria": UMBRAL[via], "garantia": "alta" if via == "verified" else "abierta"}
-        result["n_custodios"] = len(shares)
-        result["nota"] = "Vías separadas por garantía; nunca se mezclan (doctrina §3.2)."
-        for via in VIAS:
-            last = conn.execute("SELECT seq,entry_hash FROM bulletin_board WHERE election_id=? ORDER BY seq DESC LIMIT 1", (eid,)).fetchone()
-            seq = last["seq"] + 1
-            payload = json.dumps({"via": via, "result": result[via]}, sort_keys=True)
-            entry_hash = cc.chain_hash(last["entry_hash"], payload)
-            conn.execute("INSERT INTO bulletin_board(election_id,seq,kind,via,payload_json,prev_hash,entry_hash,created) VALUES(?,?,?,?,?,?,?,?)",
-                         (eid, seq, "result", via, payload, last["entry_hash"], entry_hash, db.now()))
-        conn.execute("UPDATE elections SET status='cerrada', result_json=? WHERE id=?", (json.dumps(result), eid))
-        conn.execute("UPDATE debates SET phase='publicar' WHERE id=?", (e["debate_id"],))
+        # Mismo orden de bloqueo que el avance automático (asunto → elección): sin interbloqueos.
+        db.lock_row(conn, "debates", did)
+        db.lock_row(conn, "elections", eid)
+        e = dict(conn.execute("SELECT * FROM elections WHERE id=?", (eid,)).fetchone())
+        if e["status"] != "abierta":
+            raise SferaError(409, "Esta votación ya está cerrada")
+        result = _tally_close(conn, e)
         conn.commit()
     return result
 
