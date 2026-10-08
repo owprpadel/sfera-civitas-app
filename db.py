@@ -634,6 +634,9 @@ _NEW_COLUMNS = [
     ("debates", "dias_vot", "INTEGER"),
     ("debates", "quorum_override", "INTEGER"),             # quórum rebajado por el admin (opcional)
     ("users", "is_demo", "INTEGER DEFAULT 0"),            # ciudadanía ficticia de los casos de demostración (sin acceso)
+    ("users", "reset_code_hash", "TEXT"),                  # recuperar contraseña: huella del código (nunca el código)
+    ("users", "reset_expires", "REAL"),                    # caducidad del código (15 min)
+    ("users", "reset_attempts", "INTEGER DEFAULT 0"),     # intentos fallidos (máx. 5)
     ("documents", "author_profile_id", "INTEGER"),        # perfil de experto al que se atribuye el documento
     ("expert_proposals", "author_profile_id", "INTEGER"), # perfil de experto al que se atribuye la propuesta
     # v55 — Biblioteca con ARCHIVOS y bibliotecas POR PROPUESTA

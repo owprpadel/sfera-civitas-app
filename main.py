@@ -43,6 +43,8 @@ _LIMITS = {  # (máx peticiones, ventana en segundos)
     "/api/login":    (int(os.environ.get("SFERA_RL_LOGIN", "20")), 900),
     "/api/verify":   (int(os.environ.get("SFERA_RL_VERIFY", "20")), 900),
     "/api/resend":   (int(os.environ.get("SFERA_RL_RESEND", "5")), 900),
+    "/api/password/forgot": (int(os.environ.get("SFERA_RL_FORGOT", "5")), 900),
+    "/api/password/reset":  (int(os.environ.get("SFERA_RL_RESET", "10")), 900),
     "/api/cert/challenge": (int(os.environ.get("SFERA_RL_CERT", "10")), 900),
     "/api/cert/verify":    (int(os.environ.get("SFERA_RL_CERT", "10")), 900),
     "/api/reports":        (int(os.environ.get("SFERA_RL_REPORTS", "30")), 3600),
@@ -159,6 +161,10 @@ class VerifyIn(BaseModel):
     email: str; code: str
 class ResendIn(BaseModel):
     email: str
+class ForgotIn(BaseModel):
+    email: str
+class ResetPwIn(BaseModel):
+    email: str; code: str; new_password: str
 class CertIn(BaseModel):
     email: str; cert_subject: str
 class CertChallengeIn(BaseModel):
@@ -252,6 +258,10 @@ def register(i: RegisterIn): return _wrap(s.register, i.email, i.password)
 def verify(i: VerifyIn): return _wrap(s.verify, i.email, i.code)
 @app.post("/api/resend")
 def resend(i: ResendIn): return _wrap(s.resend_code, i.email)
+@app.post("/api/password/forgot")                         # recuperar contraseña: envía un código (no revela si el email existe)
+def password_forgot(i: ForgotIn): return _wrap(s.forgot_password, i.email)
+@app.post("/api/password/reset")                          # recuperar contraseña: código + contraseña nueva
+def password_reset(i: ResetPwIn): return _wrap(s.reset_password, i.email, i.code, i.new_password)
 @app.post("/api/verify-certificate")
 def verify_certificate(i: CertIn): return _wrap(s.verify_certificate, i.email, i.cert_subject)
 

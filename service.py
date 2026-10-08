@@ -688,6 +688,72 @@ def login(email: str, password: str) -> dict:
             "is_admin": is_admin, "email": d.get("email") or email}
 
 
+# ── Recuperar contraseña (código de 6 números por email, 15 minutos, 5 intentos) ──
+RESET_MIN = 15
+RESET_MAX_TRIES = 5
+
+
+def _reset_hash(uid, code: str) -> str:
+    return hmac.new(_SECRET, f"reset:{uid}:{code}".encode(), hashlib.sha256).hexdigest()
+
+
+def _reset_user(conn, email: str):
+    row = conn.execute("SELECT * FROM users WHERE lower(email)=? ORDER BY id LIMIT 1", (email,)).fetchone()
+    if not row:
+        return None
+    row = dict(row)
+    if str(row["email"]).endswith("@deleted.invalid") or row.get("is_demo") or \
+            str(row.get("pass_hash") or "").startswith(("deleted$", "demo-disabled$")):
+        return None
+    return row
+
+
+def forgot_password(email: str) -> dict:
+    """Envía un código para poner una contraseña nueva. Responde IGUAL exista o no
+    la cuenta (no revela qué emails están registrados)."""
+    email = (email or "").strip().lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise SferaError(400, "Escribe un email válido")
+    out = {"ok": True}
+    with db.session() as conn:
+        row = _reset_user(conn, email)
+        if not row:
+            return out
+        code = f"{secrets.randbelow(1000000):06d}"
+        conn.execute("UPDATE users SET reset_code_hash=?, reset_expires=?, reset_attempts=0 WHERE id=?",
+                     (_reset_hash(row["id"], code), db.now() + RESET_MIN * 60, row["id"]))
+        conn.commit()
+    _send_email_async(email, "Cambia tu contraseña de Sfera Civitas",
+                      f"Tu código para poner una contraseña nueva es: {code}\n\n"
+                      f"Caduca en {RESET_MIN} minutos. Si no lo has pedido tú, ignora este mensaje: tu contraseña no cambia.")
+    if not _mail_configured():
+        out["codigo_piloto"] = code
+    return out
+
+
+def reset_password(email: str, code: str, new_password: str) -> dict:
+    email = (email or "").strip().lower()
+    code = re.sub(r"\D", "", str(code or ""))
+    if not new_password or len(new_password) < 8:
+        raise SferaError(400, "La nueva contraseña debe tener al menos 8 caracteres")
+    bad = SferaError(400, "Código incorrecto o caducado. Pide uno nuevo.")
+    with db.session() as conn:
+        row = _reset_user(conn, email)
+        if not row or not row.get("reset_code_hash") or float(row.get("reset_expires") or 0) < db.now():
+            raise bad
+        if int(row.get("reset_attempts") or 0) >= RESET_MAX_TRIES:
+            raise SferaError(400, "Demasiados intentos. Pide un código nuevo.")
+        if len(code) != 6 or not hmac.compare_digest(_reset_hash(row["id"], code), row["reset_code_hash"]):
+            conn.execute("UPDATE users SET reset_attempts=COALESCE(reset_attempts,0)+1 WHERE id=?", (row["id"],))
+            conn.commit()
+            raise bad
+        # El código llega al email: queda también demostrado que el email es suyo.
+        conn.execute("UPDATE users SET pass_hash=?, reset_code_hash=NULL, reset_expires=NULL, reset_attempts=0, "
+                     "verified=1, twofa_code=NULL WHERE id=?", (_hash_pw(new_password), row["id"]))
+        conn.commit()
+    return {"ok": True}
+
+
 def change_password(uid, old_password: str, new_password: str) -> dict:
     if not new_password or len(new_password) < 8:
         raise SferaError(400, "La nueva contraseña debe tener al menos 8 caracteres")
