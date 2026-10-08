@@ -79,13 +79,13 @@ def can_admin_new(conn, user, administracion, materia) -> bool:
 def grant_role(granter: dict, email: str, role: str, scope_type: str, scope_value: str = "") -> dict:
     """SOLO Super Admin crea admins/expertos por ámbito."""
     if not is_super(granter):
-        raise SferaError(403, "Solo el Super Admin puede nombrar admins o expertos por ámbito")
+        raise SferaError(403, "Solo la administración general puede dar permisos de administración o de experto")
     if role not in ROLES:
-        raise SferaError(400, "role debe ser 'admin' o 'expert'")
+        raise SferaError(400, "Elige un permiso: administración o experto")
     if scope_type not in SCOPES:
-        raise SferaError(400, "scope_type inválido")
+        raise SferaError(400, "Elige dónde se aplica el permiso")
     if scope_type != "global" and not (scope_value or "").strip():
-        raise SferaError(400, "Falta el valor del ámbito (AAPP, materia o id de asunto)")
+        raise SferaError(400, "Indica la administración, la materia o el número del asunto")
     if scope_type == "global":
         scope_value = ""
     with db.session() as conn:
@@ -98,7 +98,7 @@ def grant_role(granter: dict, email: str, role: str, scope_type: str, scope_valu
                             VALUES(?,?,?,?,?,?)""",
                          (uid, role, scope_type, scope_value, granter["id"], db.now()))
         except db.INTEGRITY_ERRORS:
-            raise SferaError(409, "Ese rol/ámbito ya estaba concedido a esa persona")
+            raise SferaError(409, "Esa persona ya tenía ese permiso")
         if role == "expert":
             conn.execute("UPDATE users SET is_expert=1 WHERE id=?", (uid,))
         conn.commit()
@@ -107,7 +107,7 @@ def grant_role(granter: dict, email: str, role: str, scope_type: str, scope_valu
 
 def revoke_grant(granter: dict, grant_id: int) -> dict:
     if not is_super(granter):
-        raise SferaError(403, "Solo el Super Admin puede revocar roles")
+        raise SferaError(403, "Solo la administración general puede retirar permisos")
     with db.session() as conn:
         conn.execute("DELETE FROM grants WHERE id=?", (grant_id,))
         conn.commit()
@@ -116,7 +116,7 @@ def revoke_grant(granter: dict, grant_id: int) -> dict:
 
 def list_grants(requester: dict) -> list:
     if not is_super(requester):
-        raise SferaError(403, "Solo el Super Admin puede ver la lista de roles")
+        raise SferaError(403, "Solo la administración general puede ver los permisos")
     with db.session() as conn:
         rows = conn.execute("""SELECT g.id,g.user_id,u.email,g.role,g.scope_type,g.scope_value,g.created
                                FROM grants g JOIN users u ON u.id=g.user_id ORDER BY g.id DESC""").fetchall()
@@ -127,7 +127,7 @@ def my_role(user: dict, did: int) -> dict:
     with db.session() as conn:
         d = conn.execute("SELECT * FROM debates WHERE id=?", (did,)).fetchone()
         if not d:
-            raise SferaError(404, "Asunto no existe")
+            raise SferaError(404, "Este asunto no existe")
         return {"is_super": is_super(user),
                 "can_admin": can_admin(conn, user, d),
                 "can_author": can_author(conn, user, d)}

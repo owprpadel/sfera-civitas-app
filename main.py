@@ -16,7 +16,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 import db
@@ -26,6 +26,10 @@ import roles as rl
 import cert_service as cs
 import support_service as sup
 import moderation as mod
+import citizen_docs as cdocs
+import experts_service as xs
+import demo_seed
+import uploads
 
 app = FastAPI(title="Sfera Civitas — Desarrollo", version="0.1")
 _origins = os.environ.get("SFERA_CORS", "*").split(",")
@@ -42,6 +46,7 @@ _LIMITS = {  # (máx peticiones, ventana en segundos)
     "/api/cert/challenge": (int(os.environ.get("SFERA_RL_CERT", "10")), 900),
     "/api/cert/verify":    (int(os.environ.get("SFERA_RL_CERT", "10")), 900),
     "/api/reports":        (int(os.environ.get("SFERA_RL_REPORTS", "30")), 3600),
+    "/api/debates":        (int(os.environ.get("SFERA_RL_DEBATES", "10")), 3600),   # convocar asuntos
 }
 # Rutas de escritura con id en la URL: el límite se aplica POR TIPO (todas las
 # rutas que casan con el patrón comparten contador por IP).
@@ -52,6 +57,21 @@ _PATTERN_LIMITS = [
      (int(os.environ.get("SFERA_RL_EXPERT", "30")), 3600)),
     (re.compile(r"^/api/expert-proposals/\d+/withdraw$"), "expert",
      (int(os.environ.get("SFERA_RL_EXPERT", "30")), 3600)),
+    # Documentos de la ciudadanía (texto, enlaces http/https y ARCHIVOS), del asunto o de una propuesta
+    (re.compile(r"^/api/debates/\d+/citizen-docs$"), "cdocs",
+     (int(os.environ.get("SFERA_RL_CDOCS", "20")), 3600)),
+    (re.compile(r"^/api/proposals/\d+/docs$"), "cdocs",
+     (int(os.environ.get("SFERA_RL_CDOCS", "20")), 3600)),
+    # Documentos de expertos (del asunto, de una propuesta experta y nuevas versiones)
+    (re.compile(r"^/api/debates/\d+/documents$"), "expertdocs",
+     (int(os.environ.get("SFERA_RL_EXPERTDOCS", "40")), 3600)),
+    (re.compile(r"^/api/expert-proposals/\d+/docs$"), "expertdocs",
+     (int(os.environ.get("SFERA_RL_EXPERTDOCS", "40")), 3600)),
+    (re.compile(r"^/api/documents/\d+/versions$"), "expertdocs",
+     (int(os.environ.get("SFERA_RL_EXPERTDOCS", "40")), 3600)),
+    # Argumentos y propuestas ciudadanas (anti-spam; holgado para uso normal)
+    (re.compile(r"^/api/debates/\d+/(arguments|proposals)$"), "ugc",
+     (int(os.environ.get("SFERA_RL_UGC", "60")), 3600)),
 ]
 
 
@@ -76,7 +96,7 @@ async def rate_limit(request: Request, call_next):
         while dq and dq[0] < now - window:
             dq.popleft()
         if len(dq) >= maxn:
-            return JSONResponse({"detail": "Demasiadas solicitudes; inténtalo más tarde."}, status_code=429)
+            return JSONResponse({"detail": "Has hecho demasiados envíos seguidos. Espera un rato y vuelve a intentarlo."}, status_code=429)
         dq.append(now)
     return await call_next(request)
 
@@ -104,17 +124,17 @@ def _wrap(fn, *a, **k):
 
 def current_user(authorization: Optional[str] = Header(None)) -> dict:
     if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(401, "No autenticado")
+        raise HTTPException(401, "Entra con tu cuenta para continuar")
     uid = s.parse_token(authorization[len("Bearer "):].strip())
     if uid is None:
-        raise HTTPException(401, "Sesión inválida o caducada")
+        raise HTTPException(401, "Tu sesión ha caducado: vuelve a entrar")
     return _wrap(s.get_user, uid)
 
 
 def admin_user(u=Depends(current_user)) -> dict:
     """Rol de administrador: convocar asuntos y abrir/cerrar votaciones y fases."""
     if not u.get("is_admin"):
-        raise HTTPException(403, "Requiere rol de administrador")
+        raise HTTPException(403, "Solo la administración puede hacer esto")
     return u
 
 
@@ -155,6 +175,19 @@ class ChangePwIn(BaseModel):
 class DebateIn(BaseModel):
     title: str; body: str = ""; materia: str = ""; administracion: str = ""
     nivel: str = ""; territorio: str = ""; org_id: Optional[int] = None
+    plan: str = "estandar"; quorum_override: Optional[int] = None      # exprés / quórum: solo administración
+class PlanIn(BaseModel):
+    plan: str; quorum_override: Optional[int] = None
+class CitizenDocIn(BaseModel):
+    kind: str; title: str; text: str = ""; url: str = ""
+    file_name: Optional[str] = None; mime_type: Optional[str] = None; data_b64: Optional[str] = None   # archivo (opcional)
+class ProfileIn(BaseModel):
+    display_name: str; specialty: str; credentials: str = ""; organization: str = ""
+    email: Optional[str] = None; debate_id: Optional[int] = None
+class AssignProfileIn(BaseModel):
+    profile_id: int
+class DemoVisIn(BaseModel):
+    scope: str; action: str
 class OrgIn(BaseModel):
     name: str
 class OrgInviteIn(BaseModel):
@@ -170,7 +203,8 @@ class ArgIn(BaseModel):
 class PropIn(BaseModel):
     text: str
 class ExpertPropIn(BaseModel):
-    title: str; text: str; justification: str = ""
+    title: str; text: str; justification: str = ""; author_profile_id: Optional[int] = None
+    formal_file_name: Optional[str] = None; formal_data_b64: Optional[str] = None   # documento formal (v55)
 class ElectionIn(BaseModel):
     question: str; options: list[str]
 class CredIn(BaseModel):
@@ -189,6 +223,14 @@ class DocIn(BaseModel):
     doc_type: str; title: str; content_kind: str = "text"
     content_text: Optional[str] = None
     file_name: Optional[str] = None; mime_type: Optional[str] = None; data_b64: Optional[str] = None
+    author_profile_id: Optional[int] = None      # admin: publicar en nombre de un experto asignado
+    expert_proposal_id: Optional[int] = None     # v55: documento de una propuesta experta
+    formal: bool = False                         # v55: es su documento formal
+class EPDocIn(BaseModel):                        # documento de una propuesta experta
+    doc_type: str = "anexo"; title: str = ""; content_kind: str = "file"
+    content_text: Optional[str] = None
+    file_name: Optional[str] = None; mime_type: Optional[str] = None; data_b64: Optional[str] = None
+    formal: bool = False; author_profile_id: Optional[int] = None
 class VersionIn(BaseModel):
     content_kind: str = "text"
     content_text: Optional[str] = None
@@ -265,7 +307,8 @@ def delete_account(i: DeleteAccountIn, u=Depends(current_user)):
 # ── debates / fases ──────────────────────────────────────────────────────────
 @app.post("/api/debates")
 def create_debate(i: DebateIn, u=Depends(current_user)):
-    return _wrap(s.create_debate, i.title, i.body, i.materia, i.administracion, u, i.nivel, i.territorio, i.org_id)
+    return _wrap(s.create_debate, i.title, i.body, i.materia, i.administracion, u, i.nivel, i.territorio, i.org_id,
+                 i.plan, i.quorum_override)
 @app.get("/api/debates")
 def list_debates(u=Depends(optional_user)): return s.list_debates(u)
 @app.get("/api/config")
@@ -304,6 +347,8 @@ def get_debate(did: int, u=Depends(optional_user)): return _wrap(s.get_debate, d
 def support_debate(did: int, u=Depends(current_user)): return _wrap(s.support_debate, did, u)
 @app.post("/api/debates/{did}/phase")
 def set_phase(did: int, i: PhaseIn, u=Depends(current_user)): return _wrap(s.set_phase, did, i.phase, u)
+@app.post("/api/debates/{did}/plan")                     # estándar ⇄ exprés (admin, solo en Convocar)
+def set_plan(did: int, i: PlanIn, u=Depends(current_user)): return _wrap(s.set_plan, did, i.plan, u, i.quorum_override)
 @app.post("/api/debates/{did}/extend")                   # ampliar plazo de la fase actual (admin, con justificación pública)
 def extend_phase(did: int, i: ExtendIn, u=Depends(current_user)):
     return _wrap(s.extend_phase, did, i.days, i.justification, u)
@@ -334,7 +379,8 @@ def util_proposal(pid: int, on: Optional[bool] = None, u=Depends(current_user)):
 def list_expert_proposals(did: int, u=Depends(optional_user)): return _wrap(s.list_expert_proposals, did, u)
 @app.post("/api/debates/{did}/expert-proposals")         # experto del asunto o admin, solo en Proponer
 def add_expert_proposal(did: int, i: ExpertPropIn, u=Depends(current_user)):
-    return _wrap(s.add_expert_proposal, did, u, i.title, i.text, i.justification)
+    return _wrap(s.add_expert_proposal, did, u, i.title, i.text, i.justification, i.author_profile_id,
+                 i.formal_file_name, i.formal_data_b64)
 @app.post("/api/expert-proposals/{epid}/withdraw")       # retirar (autor o admin), solo en Proponer
 def withdraw_expert_proposal(epid: int, u=Depends(current_user)): return _wrap(s.withdraw_expert_proposal, epid, u)
 
@@ -357,14 +403,82 @@ def close_election(eid: int, u=Depends(current_user)): return _wrap(s.close_elec
 def get_board(eid: int): return s.get_board(eid)
 @app.get("/api/elections/{eid}/audit")
 def audit(eid: int): return _wrap(s.audit, eid)
+@app.get("/api/elections/{eid}/receipt/{code}")          # PÚBLICO: ¿sigue mi voto en la urna? (comprobante AB12-CD34)
+def check_receipt(eid: int, code: str): return _wrap(s.check_receipt, eid, code)
 
 
 # ── repositorio documental (biblioteca por asunto) ────────────────────────────
 @app.post("/api/debates/{did}/experts")
 def assign_expert(did: int, i: ExpertIn, u=Depends(current_user)):
     return _wrap(ds.assign_expert, did, (i.email if i.email else i.user_id), u)
-@app.get("/api/debates/{did}/experts")
-def list_experts(did: int): return ds.list_experts(did)
+@app.get("/api/debates/{did}/experts")                    # emails solo para la administración del asunto
+def list_experts(did: int, u=Depends(optional_user)): return ds.list_experts(did, u)
+# ── Perfiles de experto con nombre (sin emails en público) ──
+@app.get("/api/debates/{did}/expert-profiles")           # PÚBLICO: expertos asignados (nombre + especialidad)
+def list_debate_profiles(did: int): return xs.list_debate_profiles(did)
+@app.post("/api/debates/{did}/expert-profiles")          # admin del asunto: asignar un perfil existente
+def assign_profile(did: int, i: AssignProfileIn, u=Depends(current_user)):
+    return _wrap(xs.assign_profile, u, did, i.profile_id)
+@app.post("/api/debates/{did}/expert-profiles/{pid}/remove")
+def unassign_profile(did: int, pid: int, u=Depends(current_user)): return _wrap(xs.unassign_profile, u, did, pid)
+@app.get("/api/expert-profiles")                         # directorio (administración)
+def list_profiles(q: str = "", u=Depends(current_user)): return _wrap(xs.list_profiles, u, q)
+@app.post("/api/expert-profiles")                        # crear (y opcionalmente asignar a un asunto)
+def create_profile(i: ProfileIn, u=Depends(current_user)):
+    return _wrap(xs.create_profile, u, i.display_name, i.specialty, i.credentials, i.organization, i.email, i.debate_id)
+@app.post("/api/expert-profiles/{pid}")                  # editar (Super Admin o quien lo creó)
+def update_profile(pid: int, i: ProfileIn, u=Depends(current_user)):
+    return _wrap(xs.update_profile, u, pid, i.display_name, i.specialty, i.credentials, i.organization, i.email)
+# ── Aportaciones documentales de la ciudadanía (cualquier fase activa) ──
+@app.get("/api/debates/{did}/citizen-docs")                # ?scope=issue → solo los del asunto (sin los de propuestas)
+def list_citizen_docs(did: int, limit: int = 50, offset: int = 0, scope: str = "all", u=Depends(optional_user)):
+    return _wrap(cdocs.list_docs, did, u, limit, offset, scope)
+@app.post("/api/debates/{did}/citizen-docs")
+def add_citizen_doc(did: int, i: CitizenDocIn, u=Depends(current_user)):
+    return _wrap(cdocs.add_doc, did, u, i.kind, i.title, i.text, i.url, False, i.file_name, i.data_b64)
+# ── v55: bibliotecas POR PROPUESTA (ciudadana y experta) + archivos ──
+@app.get("/api/debates/{did}/proposal-docs")             # vista «Por propuesta» de la biblioteca del asunto
+def proposal_docs_index(did: int, u=Depends(optional_user)): return _wrap(s.proposal_docs_index, did, u)
+@app.get("/api/proposals/{pid}/docs")                    # biblioteca de una propuesta ciudadana (pública, siempre)
+def list_proposal_docs(pid: int, u=Depends(optional_user)): return _wrap(cdocs.list_proposal_docs, pid, u)
+@app.post("/api/proposals/{pid}/docs")                   # su autor, solo en Proponer
+def add_proposal_doc(pid: int, i: CitizenDocIn, u=Depends(current_user)):
+    def _go():
+        with db.session() as conn:
+            r = conn.execute("SELECT debate_id FROM proposals WHERE id=?", (pid,)).fetchone()
+        if not r:
+            raise s.SferaError(404, "Esta propuesta no existe o se ha retirado")
+        return cdocs.add_doc(dict(r)["debate_id"], u, i.kind, i.title, i.text, i.url, False, i.file_name, i.data_b64, pid)
+    return _wrap(_go)
+@app.get("/api/expert-proposals/{epid}/docs")            # biblioteca de una propuesta experta (documento formal + otros)
+def list_ep_docs(epid: int, u=Depends(optional_user)): return _wrap(ds.list_expert_proposal_docs, epid, u)
+@app.post("/api/expert-proposals/{epid}/docs")           # experto del asunto o admin, solo en Proponer
+def add_ep_doc(epid: int, i: EPDocIn, u=Depends(current_user)):
+    def _go():
+        with db.session() as conn:
+            r = conn.execute("SELECT debate_id, title FROM expert_proposals WHERE id=?", (epid,)).fetchone()
+        if not r:
+            raise s.SferaError(404, "Esta propuesta de expertos no existe")
+        r = dict(r)
+        title = i.title or (("Documento de la propuesta: " + r["title"]) if i.formal else "")
+        return ds.create_document(r["debate_id"], u, i.doc_type, title, i.content_kind, i.content_text,
+                                  i.file_name, i.mime_type, i.data_b64, "publicado", i.author_profile_id, epid, i.formal)
+    return _wrap(_go)
+def _file_response(raw: bytes, name: str, ctype: str) -> Response:
+    return Response(content=raw, media_type=ctype, headers=uploads.headers_for(name))
+@app.get("/api/files/doc/{doc_id}")                      # descarga de un archivo de experto (?v=versión)
+def download_doc(doc_id: int, v: Optional[int] = None):
+    return _file_response(*_wrap(ds.file_content, doc_id, v))
+@app.get("/api/files/cdoc/{cid}")                        # descarga de un archivo de la ciudadanía
+def download_cdoc(cid: int, u=Depends(optional_user)):
+    return _file_response(*_wrap(cdocs.file_content, cid, u))
+# ── Casos de demostración (Super Admin) ──
+@app.get("/api/admin/demo")
+def demo_status(u=Depends(current_user)): return _wrap(demo_seed.status, u)
+@app.post("/api/admin/demo/seed")
+def demo_seed_run(u=Depends(current_user)): return _wrap(demo_seed.seed, u)
+@app.post("/api/admin/demo/visibility")                  # scope legacy|demo · action hide|show (reversible)
+def demo_visibility(i: DemoVisIn, u=Depends(current_user)): return _wrap(demo_seed.set_visibility, u, i.scope, i.action)
 @app.get("/api/debates/{did}/myrole")
 def my_role(did: int, u=Depends(current_user)): return _wrap(rl.my_role, u, did)
 
@@ -378,11 +492,12 @@ def list_grants(u=Depends(current_user)): return _wrap(rl.list_grants, u)
 def revoke_grant(i: GrantRevokeIn, u=Depends(current_user)): return _wrap(rl.revoke_grant, u, i.grant_id)
 
 @app.get("/api/debates/{did}/documents")                 # LECTURA pública
-def list_documents(did: int): return ds.list_documents(did)
+def list_documents(did: int, u=Depends(optional_user)): return ds.list_documents(did, u)
 @app.post("/api/debates/{did}/documents")                # crear oficial: experto/admin
 def create_document(did: int, i: DocIn, u=Depends(current_user)):
     return _wrap(ds.create_document, did, u, i.doc_type, i.title, i.content_kind,
-                 i.content_text, i.file_name, i.mime_type, i.data_b64)
+                 i.content_text, i.file_name, i.mime_type, i.data_b64, "publicado", i.author_profile_id,
+                 i.expert_proposal_id, i.formal)
 @app.get("/api/documents/{doc_id}")                      # LECTURA pública
 def get_document(doc_id: int, u=Depends(optional_user)): return _wrap(ds.get_document, doc_id, u)
 @app.get("/api/documents/{doc_id}/versions/{n}")         # contenido público

@@ -2,6 +2,7 @@
 y registro con certificado digital), pruebas ZK de papeleta y custodios distribuidos.
 Ejecuta: python test_service.py"""
 import os, secrets
+os.environ.setdefault("SFERA_CERT_SIM_ALLOWED", "1")  # simulación de certificado solo en tests
 os.environ["SFERA_DB"] = "/tmp/sfera_test.db"
 os.environ.setdefault("SFERA_ADMIN_EMAILS", "admin@sfera.org")  # admin para abrir/cerrar votación
 if os.path.exists("/tmp/sfera_test.db"):

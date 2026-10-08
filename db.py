@@ -468,6 +468,44 @@ CREATE TABLE IF NOT EXISTS content_moderation (
   PRIMARY KEY (target_type, target_id)
 );
 -- Bloqueos entre usuarios: el bloqueador deja de ver el contenido del bloqueado.
+-- CAPA DOCUMENTAL CIUDADANA (oct-2026): aportaciones documentales de cualquier
+-- persona registrada en CUALQUIER fase activa (convocar, deliberar, proponer, votar),
+-- separadas de los documentos de expertos. Solo texto y/o enlace http(s): sin ficheros.
+CREATE TABLE IF NOT EXISTS citizen_docs (
+  id {AUTOINC},
+  debate_id INTEGER NOT NULL REFERENCES debates(id),
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  kind TEXT NOT NULL,                   -- enlace | dato | estudio | noticia | otro
+  title TEXT NOT NULL,
+  text TEXT,
+  url TEXT,                             -- solo http/https
+  phase TEXT,                           -- fase en la que se aportó
+  created {REAL}
+);
+CREATE INDEX IF NOT EXISTS ix_citizen_docs_debate ON citizen_docs(debate_id);
+-- PERFILES DE EXPERTO (oct-2026): nombre público, especialidad, credenciales y
+-- organización (opcional). Pueden existir SIN cuenta de acceso (user_id NULL): el
+-- admin del asunto publica en su nombre y queda registrado quién lo hizo (created_by).
+-- Nunca se muestra un email en público.
+CREATE TABLE IF NOT EXISTS expert_profiles (
+  id {AUTOINC},
+  user_id INTEGER,                      -- cuenta vinculada (opcional)
+  display_name TEXT NOT NULL,
+  specialty TEXT,                       -- materia / especialidad
+  credentials TEXT,                     -- credenciales breves
+  organization TEXT,                    -- organización (opcional, descripción genérica)
+  is_demo INTEGER DEFAULT 0,            -- perfil ficticio de los casos de demostración
+  created_by INTEGER,
+  created {REAL},
+  updated {REAL}
+);
+CREATE TABLE IF NOT EXISTS debate_expert_profiles (   -- perfiles asignados a un asunto
+  debate_id INTEGER NOT NULL REFERENCES debates(id),
+  profile_id INTEGER NOT NULL REFERENCES expert_profiles(id),
+  assigned_by INTEGER,
+  assigned_at {REAL},
+  PRIMARY KEY (debate_id, profile_id)
+);
 CREATE TABLE IF NOT EXISTS user_blocks (
   blocker_id INTEGER NOT NULL REFERENCES users(id),
   blocked_id INTEGER NOT NULL REFERENCES users(id),
@@ -568,8 +606,62 @@ def init_db():
                 conn.commit()
         except Exception:
             pass
+    # ── Migraciones oct-2026 (idempotentes, ambos backends) ──
+    for table, col, ddl in _NEW_COLUMNS:
+        _add_column(conn, table, col, ddl)
+    for ddl in ("CREATE INDEX IF NOT EXISTS ix_documents_eprop ON documents(expert_proposal_id)",
+                "CREATE INDEX IF NOT EXISTS ix_citizen_docs_prop ON citizen_docs(proposal_id)"):
+        try:
+            conn.execute(ddl); conn.commit()
+        except Exception as e:   # nunca impide arrancar
+            try: conn._raw.rollback()
+            except Exception: pass
+            print(f"[sfera] índice: {e}")
     seed_and_clean(conn)
     conn.close()
+
+
+# (tabla, columna, tipo) — se añaden si faltan. {REAL} se adapta al backend.
+_NEW_COLUMNS = [
+    ("debates", "is_demo", "INTEGER DEFAULT 0"),          # caso de demostración (marcador oculto)
+    ("debates", "demo_key", "TEXT"),                       # clave idempotente del caso de demostración
+    ("debates", "demo_archived", "INTEGER DEFAULT 0"),    # ocultado por el botón de ejemplos (reversible)
+    ("debates", "plan", "TEXT DEFAULT 'estandar'"),       # 'estandar' | 'express'
+    ("debates", "dias_conv", "INTEGER"),                   # duración propia de cada fase (NULL = estándar)
+    ("debates", "dias_delib", "INTEGER"),
+    ("debates", "dias_prop", "INTEGER"),
+    ("debates", "dias_vot", "INTEGER"),
+    ("debates", "quorum_override", "INTEGER"),             # quórum rebajado por el admin (opcional)
+    ("users", "is_demo", "INTEGER DEFAULT 0"),            # ciudadanía ficticia de los casos de demostración (sin acceso)
+    ("documents", "author_profile_id", "INTEGER"),        # perfil de experto al que se atribuye el documento
+    ("expert_proposals", "author_profile_id", "INTEGER"), # perfil de experto al que se atribuye la propuesta
+    # v55 — Biblioteca con ARCHIVOS y bibliotecas POR PROPUESTA
+    ("documents", "expert_proposal_id", "INTEGER"),       # documento de una propuesta experta (NULL = del asunto)
+    ("documents", "is_formal", "INTEGER DEFAULT 0"),      # 1 = documento formal de la propuesta experta
+    ("citizen_docs", "proposal_id", "INTEGER"),           # aportación adjunta a una propuesta ciudadana (NULL = del asunto)
+    ("citizen_docs", "file_name", "TEXT"),                # archivo adjunto (validado en uploads.py)
+    ("citizen_docs", "mime_type", "TEXT"),
+    ("citizen_docs", "file_size", "INTEGER"),
+    ("citizen_docs", "data_b64", "TEXT"),
+    ("citizen_docs", "sha256", "TEXT"),
+]
+
+
+def _add_column(conn, table: str, col: str, ddl: str) -> None:
+    ddl = ddl.replace("{REAL}", _TYPES["REAL"])
+    try:
+        if BACKEND == "postgres":
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {ddl}")
+            conn.commit()
+        else:
+            cols = [r[1] for r in conn._raw.execute(f"PRAGMA table_info({table})").fetchall()]  # type: ignore[attr-defined]
+            if col not in cols:
+                conn._raw.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")  # type: ignore[attr-defined]
+                conn.commit()
+    except Exception as e:  # nunca impide arrancar
+        try: conn._raw.rollback()
+        except Exception: pass
+        print(f"[sfera] migración {table}.{col}: {e}")
 
 
 # Patrones de títulos de datos de PRUEBA (E2E) que NO deben mostrarse en producción.
@@ -596,16 +688,12 @@ def seed_and_clean(conn):
         # 1) Archivar datos de prueba (hidden=1). No se eliminan (auditabilidad).
         for pref in _TEST_TITLE_PREFIXES:
             conn.execute("UPDATE debates SET hidden=1 WHERE title LIKE ?", (pref + "%",))
-        # 2) Sembrar ejemplos si no están ya (por título). Si existen, completa nivel/territorio.
+        # 2) Los asuntos de ejemplo antiguos YA NO se siembran (oct-2026): los casos de
+        #    demostración se crean a petición del admin («Crear casos de demostración»).
+        #    Si existen de antes, solo se completa nivel/territorio (compatibilidad).
         for title, body, materia, admin, nivel, terr in _SEED_DEBATES:
-            ex = conn.execute("SELECT id FROM debates WHERE title=?", (title,)).fetchone()
-            if not ex:
-                conn.execute(
-                    "INSERT INTO debates(title,body,materia,administracion,nivel,territorio,phase,hidden,created) "
-                    "VALUES(?,?,?,?,?,?,'deliberar',0,?)", (title, body, materia, admin, nivel, terr, now()))
-            else:
-                conn.execute("UPDATE debates SET nivel=COALESCE(nivel,?), territorio=COALESCE(territorio,?) WHERE title=?",
-                             (nivel, terr, title))
+            conn.execute("UPDATE debates SET nivel=COALESCE(nivel,?), territorio=COALESCE(territorio,?) WHERE title=?",
+                         (nivel, terr, title))
         conn.commit()
     except Exception:
         try: conn._raw.rollback()

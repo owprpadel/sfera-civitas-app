@@ -123,8 +123,8 @@ check(abs(d["phase_deadline"] - (old_dl + s.PROP_DIAS * DAY)) < 1, "plazo de pro
 d2 = s.get_debate(did)
 check(d2["phase"] == "proponer" and d2["phase_deadline"] == d["phase_deadline"], "idempotente (segunda lectura no cambia nada)")
 expect_error(lambda: s.add_argument(did, autor["id"], "favor", "tarde"), 409, "proponer: deliberación cerrada",
-             "La deliberación de este asunto está cerrada")
-check(any("Propuestas" in n["text"] for n in s.list_notifications(autor)["items"]), "aviso al proponente del cambio de fase")
+             "La fase Deliberar de este asunto ya ha terminado")
+check(any("Proponer" in n["text"] for n in s.list_notifications(autor)["items"]), "aviso al proponente del cambio de fase")
 
 print("3) Propuestas CIUDADANAS y apoyos (insumo; no se votan)")
 pids = []
@@ -198,11 +198,11 @@ check(d["election"]["question"] == d["title"], "pregunta = título del asunto")
 check(d["election"]["n_votos"] == 0, "n_votos = 0 al abrir")
 check(one("SELECT COUNT(*) AS n FROM elections WHERE debate_id=?", (did,))["n"] == 1, "una sola elección creada")
 check(d["phase_dias_restantes"] == s.VOTACION_DIAS or d["phase_dias_restantes"] == s.VOTACION_DIAS - 1, "plazo de votación fijado")
-expect_error(lambda: s.add_proposal(did, autor["id"], "tarde"), 409, "votar: propuestas cerradas", "está cerrada")
-expect_error(lambda: s.support_proposal(P4, u[0]), 409, "votar: apoyos cerrados", "está cerrada")
-expect_error(lambda: ep(did, experto, "Tardía"), 409, "votar: propuestas expertas cerradas", "está cerrada")
-expect_error(lambda: s.withdraw_expert_proposal(r1["id"], experto), 409, "votar: no se retira una propuesta experta", "está cerrada")
-expect_error(lambda: s.toggle_util("proposal", P4, u[0]), 409, "votar: «útil» en propuestas cerrado", "está cerrada")
+expect_error(lambda: s.add_proposal(did, autor["id"], "tarde"), 409, "votar: propuestas cerradas", "ya ha terminado")
+expect_error(lambda: s.support_proposal(P4, u[0]), 409, "votar: apoyos cerrados", "ya ha terminado")
+expect_error(lambda: ep(did, experto, "Tardía"), 409, "votar: propuestas expertas cerradas", "ya ha terminado")
+expect_error(lambda: s.withdraw_expert_proposal(r1["id"], experto), 409, "votar: no se retira una propuesta experta", "ya ha terminado")
+expect_error(lambda: s.toggle_util("proposal", P4, u[0]), 409, "votar: «útil» en propuestas cerrado", "ya ha terminado")
 eid = d["election"]["id"]
 expect_error(lambda: s.close_election(eid, autor), 403, "no-admin no cierra la votación")
 expect_error(lambda: s.extend_phase(did, 3, "Motivo suficientemente largo", autor), 403, "no-admin no amplía plazos")
@@ -256,17 +256,17 @@ ds.assign_expert(did3, "fexperto@sfera.org", admin)
 s.set_phase(did3, "proponer", admin)
 check(abs(s.get_debate(did3)["phase_deadline"] - (db.now() + s.PROP_DIAS * DAY)) < 60 and s.PROP_DIAS == 14,
       "proponer dura 14 días por defecto (SFERA_PROP_DIAS)")
-check(any("propuestas expertas" in n["text"] for n in s.list_notifications(experto)["items"]),
+check(any("propuestas de expertos" in n["text"] for n in s.list_notifications(experto)["items"]),
       "al abrirse Proponer se avisa a los expertos del asunto")
 s.add_proposal(did3, u[0]["id"], "Una fuente cada 300 metros")   # hay propuestas CIUDADANAS, pero no cuentan
 past(did3, 1)
 d = s.get_debate(did3)
 check(d["phase"] == "proponer" and d["conv_status"] not in s.STOPPED and d["phase_dias_restantes"] in (s.PROP_EXT_DIAS - 1, s.PROP_EXT_DIAS),
       "1ª vez: se amplía PROP_EXT_DIAS (7) aunque haya propuestas ciudadanas")
-check(len(d["extensions"]) == 1 and d["extensions"][0]["auto"] and "propuesta experta" in d["extensions"][0]["justification"]
+check(len(d["extensions"]) == 1 and d["extensions"][0]["auto"] and "propuesta de expertos" in d["extensions"][0]["justification"]
       and d["extensions"][0]["days"] == s.PROP_EXT_DIAS, "ampliación automática registrada y visible")
-check(any("no tiene propuestas expertas" in n["text"] for n in s.list_notifications(admin)["items"]), "aviso a admins")
-check(any("no tiene propuestas expertas" in n["text"] for n in s.list_notifications(experto)["items"]), "aviso a expertos del asunto")
+check(any("no tiene propuestas de expertos" in n["text"] for n in s.list_notifications(admin)["items"]), "aviso a admins")
+check(any("no tiene propuestas de expertos" in n["text"] for n in s.list_notifications(experto)["items"]), "aviso a expertos del asunto")
 past(did3, 1)
 d = s.get_debate(did3)
 check(d["phase"] == "proponer" and d["conv_status"] == "sin_propuestas_expertas" and d["phase_deadline"] is None,
@@ -275,8 +275,8 @@ check(not d["election"], "no se abre votación vacía")
 check(any("se detiene" in n["text"] for n in s.list_notifications(experto)["items"]), "aviso de detención a expertos")
 past(did3, 1); d = s.get_debate(did3)
 check(d["conv_status"] == "sin_propuestas_expertas" and len(d["extensions"]) == 1, "detenido es estable (no amplía otra vez)")
-expect_error(lambda: s.add_proposal(did3, autor["id"], "tarde"), 409, "detenido: no admite propuestas ciudadanas", "está cerrada")
-expect_error(lambda: s.set_phase(did3, "votar", admin), 409, "set_phase votar sin propuestas expertas: error claro", "No hay propuestas expertas")
+expect_error(lambda: s.add_proposal(did3, autor["id"], "tarde"), 409, "detenido: no admite propuestas ciudadanas", "ya ha terminado")
+expect_error(lambda: s.set_phase(did3, "votar", admin), 409, "set_phase votar sin propuestas expertas: error claro", "Aún no hay propuestas de expertos")
 s.extend_phase(did3, 5, "Reabrimos tras petición vecinal registrada", admin)
 d = s.get_debate(did3)
 check(d["conv_status"] == "avanzado" and d["phase_dias_restantes"] == 5, "admin reabre con ampliación justificada")
@@ -285,7 +285,7 @@ check(s.get_debate(did3)["proposals_total"] == 2, "vuelve a admitir propuestas c
 past(did3, 1); d = s.get_debate(did3)
 check(d["conv_status"] == "sin_propuestas_expertas", "tras la reapertura sin propuestas expertas, se detiene de nuevo")
 ep(did3, experto, "Una fuente accesible por parque")
-check(any("ya tiene una propuesta experta" in n["text"] for n in s.list_notifications(admin)["items"]),
+check(any("ya tiene una propuesta de expertos" in n["text"] for n in s.list_notifications(admin)["items"]),
       "detenido: un experto aún puede publicar y se avisa a la administración")
 expect_error(lambda: s.set_phase(did3, "votar", autor), 403, "no-admin no abre la votación")
 s.set_phase(did3, "votar", admin)
@@ -295,8 +295,8 @@ check(d["phase"] == "votar" and d["conv_status"] == "avanzado" and d["election"]
 did3b = s.create_debate("Bancos a la sombra", "", "Urbanismo", "Ayuntamiento", autor)["debate_id"]
 s.set_phase(did3b, "proponer", admin)
 s.add_proposal(did3b, autor["id"], "Bancos bajo los árboles")
-expect_error(lambda: s.set_phase(did3b, "votar", admin), 409, "set_phase votar con solo propuestas ciudadanas: rechazado", "No hay propuestas expertas")
-expect_error(lambda: s.open_election(did3b, "¿?", ["Sí", "No"], admin), 409, "apertura manual sin propuestas expertas: rechazada", "No hay propuestas expertas")
+expect_error(lambda: s.set_phase(did3b, "votar", admin), 409, "set_phase votar con solo propuestas ciudadanas: rechazado", "Aún no hay propuestas de expertos")
+expect_error(lambda: s.open_election(did3b, "¿?", ["Sí", "No"], admin), 409, "apertura manual sin propuestas expertas: rechazada", "Aún no hay propuestas de expertos")
 ep(did3b, admin, "Veinte bancos con sombra")
 r = s.open_election(did3b, "¿Qué hacemos con los bancos?", ["Sí", "No"], admin)
 check(r["options"] == ["Veinte bancos con sombra", s.NONE_OPTION], "apertura manual: ignora opciones propias, usa las expertas")
@@ -377,9 +377,9 @@ dd = s.get_debate(did7, u[0])
 check(dd["arguments"][0]["utiles"] == 2 and dd["arguments"][0]["util_by_me"] and not s.get_debate(did7)["arguments"][0]["util_by_me"],
       "get_debate: útiles y util_by_me por usuario (anónimo: False)")
 expect_error(lambda: s.toggle_util("argument", 999999, u[0]), 404, "útil en argumento inexistente")
-expect_error(lambda: s.toggle_util("proposal", P1, u[0]), 409, "útil en propuesta fuera de Proponer", "está cerrada")
+expect_error(lambda: s.toggle_util("proposal", P1, u[0]), 409, "útil en propuesta fuera de Proponer", "ya ha terminado")
 s.set_phase(did7, "proponer", admin)
-expect_error(lambda: s.toggle_util("argument", a1, u[2]), 409, "útil en argumentos con la deliberación cerrada", "está cerrada")
+expect_error(lambda: s.toggle_util("argument", a1, u[2]), 409, "útil en argumentos con la deliberación cerrada", "ya ha terminado")
 pp = s.add_proposal(did7, autor["id"], "Carril bus de 7 a 21h")["id"]
 r = s.toggle_util("proposal", pp, u[0]); s.toggle_util("proposal", pp, u[1])
 check(s.list_proposals(did7, u[0])["items"][0]["utiles"] == 2 and s.list_proposals(did7, u[0])["items"][0]["util_by_me"],

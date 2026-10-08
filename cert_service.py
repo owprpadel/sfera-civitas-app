@@ -138,7 +138,10 @@ def verify(email: str, nonce_id, signature_b64: str, cert_pem: str,
     email = (email or "").strip().lower()
 
     if MODE == "sim":
-        # Comportamiento heredado simulado (NO validar): mantiene DEV operativo.
+        # Simulación SOLO para desarrollo/tests. En producción NUNCA marca a nadie como verificado
+        # sin validar el certificado (agujero detectado el 08-oct: cualquiera podía "verificarse").
+        if os.environ.get("SFERA_CERT_SIM_ALLOWED") != "1":
+            raise CertError(403, "La verificación con certificado digital todavía no está disponible.")
         return _mark_verified_sim(email, cert_pem or signature_b64 or "sim")
 
     if not _CRYPTO:

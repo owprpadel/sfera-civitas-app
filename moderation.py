@@ -29,6 +29,8 @@ TARGETS = {
     "proposal": ("proposals", "user_id", "text"),
     "contribution": ("document_contributions", "user_id", "text"),
     "expert_proposal": ("expert_proposals", "author_id", "title"),
+    "citizen_doc": ("citizen_docs", "user_id", "title"),
+    "document": ("documents", "created_by", "title"),      # documentos de expertos (v55: también archivos)
 }
 # Estados en content_moderation que retiran el contenido de las vistas públicas.
 HIDDEN_STATES = ("auto_hidden", "hidden", "removed")
@@ -75,14 +77,14 @@ def _target(conn, target_type: str, target_id: int):
     row = conn.execute(f"SELECT id, {author_col} AS author_id, {text_col} AS preview FROM {table} WHERE id=?",
                        (target_id,)).fetchone()
     if not row:
-        raise SferaError(404, "El contenido no existe")
+        raise SferaError(404, "Este contenido no existe")
     return dict(row)
 
 
 # ── Denunciar ─────────────────────────────────────────────────────────────────
 def report_content(user, target_type: str, target_id: int, reason: str, text: str = "") -> dict:
     if reason not in REASONS:
-        raise SferaError(400, "Motivo no válido (ofensivo, odio_acoso, spam, ilegal, otro)")
+        raise SferaError(400, "Elige un motivo de la lista")
     text = (text or "").strip()[:1000]
     now = db.now()
     with db.session() as conn:
@@ -126,7 +128,7 @@ def list_reports(user, status: str = "pending") -> list:
     """Denuncias agrupadas por contenido (por defecto, las pendientes)."""
     with db.session() as conn:
         if not can_moderate(conn, user):
-            raise SferaError(403, "Requiere rol de moderación (administrador)")
+            raise SferaError(403, "Solo la administración puede revisar denuncias")
         rows = conn.execute("""SELECT target_type,target_id,COUNT(*) AS n,MIN(created) AS first_at,MAX(created) AS last_at
                                FROM reports WHERE status=? GROUP BY target_type,target_id
                                ORDER BY COUNT(*) DESC, MAX(created) DESC""", (status,)).fetchall()
@@ -151,14 +153,14 @@ def list_reports(user, status: str = "pending") -> list:
 
 def resolve(user, target_type: str, target_id: int, action: str, note: str = "") -> dict:
     if action not in ACTIONS:
-        raise SferaError(400, "Acción no válida (keep, hide, remove)")
+        raise SferaError(400, "Acción no válida")
     if target_type not in TARGETS:
         raise SferaError(400, "Tipo de contenido no válido")
     status = {"keep": "kept", "hide": "hidden", "remove": "removed"}[action]
     now = db.now()
     with db.session() as conn:
         if not can_moderate(conn, user):
-            raise SferaError(403, "Requiere rol de moderación (administrador)")
+            raise SferaError(403, "Solo la administración puede revisar denuncias")
         _target(conn, target_type, target_id)
         if conn.execute("SELECT 1 FROM content_moderation WHERE target_type=? AND target_id=?",
                         (target_type, target_id)).fetchone():
