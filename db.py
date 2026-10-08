@@ -80,7 +80,8 @@ class Conn:
             if returning and "RETURNING" not in sql.upper():
                 sql = sql.rstrip().rstrip(";") + " RETURNING id"
             cur = self._raw.cursor()
-            cur.execute(sql, params)
+            # Sin parámetros → None: psycopg no interpreta un «%» literal (p. ej. LIKE 'abc%') como marcador.
+            cur.execute(sql, params if params else None)
             lastid = None
             if returning:
                 row = cur.fetchone()

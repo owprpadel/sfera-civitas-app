@@ -493,7 +493,7 @@ def _is_super(user) -> bool:
 
 def _demo_citizens(conn) -> list:
     rows = [int(dict(r)["id"]) for r in conn.execute(
-        "SELECT id FROM users WHERE COALESCE(is_demo,0)=1 AND email LIKE 'ciudadania-demo-%' ORDER BY id").fetchall()]
+        "SELECT id FROM users WHERE COALESCE(is_demo,0)=1 AND email LIKE ? ORDER BY id", ("ciudadania-demo-%",)).fetchall()]
     now = db.now()
     for i in range(len(rows), N_CITIZENS):
         email = f"ciudadania-demo-{i + 1:03d}@demo.sferacivitas.invalid"
@@ -669,13 +669,16 @@ def _seed_case(admin, c, citizens) -> dict:
     return {"did": did, "pending_close": pending}
 
 
-def seed(admin) -> dict:
-    """Crea los casos de demostración que falten (idempotente por demo_key)."""
+def seed(admin, max_new=None) -> dict:
+    """Crea los casos de demostración que falten (idempotente por demo_key).
+    max_new: como mucho N casos nuevos por llamada (la web llama en bucle para no
+    superar el tiempo máximo del reenvío de Netlify). Devuelve `remaining`."""
     if not _is_super(admin):
         raise SferaError(403, "Solo la administración general puede crear casos de demostración")
     with db.session() as conn:
         citizens = _demo_citizens(conn)
     log, pending = [], []
+    created_now, remaining = 0, 0
     for c in CASES:
         key = f"demo-{DEMO_VERSION}-{c['key']}"
         with db.session() as conn:
@@ -691,14 +694,21 @@ def seed(admin) -> dict:
             if open_e:
                 pending.append({"debate_id": ex["id"], "election_id": open_e})
             continue
+        if max_new is not None and created_now >= max_new:
+            remaining += 1
+            continue
         try:
+            created_now += 1
             r = _seed_case(admin, c, citizens)
             log.append({"key": c["key"], "phase": c["phase"], "id": r["did"], "status": "creado"})
             if r["pending_close"]:
                 pending.append({"debate_id": r["did"], "election_id": r["pending_close"]})
         except SferaError as e:
             log.append({"key": c["key"], "phase": c["phase"], "status": "error", "error": e.msg})
-    return {"ok": True, "items": log, "pending_close": pending}
+        except Exception as e:                   # fallo inesperado: se informa del caso y se sigue (detalle en el registro del servidor)
+            import traceback; traceback.print_exc()
+            log.append({"key": c["key"], "phase": c["phase"], "status": "error", "error": type(e).__name__})
+    return {"ok": True, "items": log, "pending_close": pending, "remaining": remaining}
 
 
 # ── Ocultar / mostrar (reversible) ─────────────────────────────────────────────

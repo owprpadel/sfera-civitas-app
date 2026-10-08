@@ -476,7 +476,7 @@ def download_cdoc(cid: int, u=Depends(optional_user)):
 @app.get("/api/admin/demo")
 def demo_status(u=Depends(current_user)): return _wrap(demo_seed.status, u)
 @app.post("/api/admin/demo/seed")
-def demo_seed_run(u=Depends(current_user)): return _wrap(demo_seed.seed, u)
+def demo_seed_run(max: int = 0, u=Depends(current_user)): return _wrap(demo_seed.seed, u, (max if max > 0 else None))
 @app.post("/api/admin/demo/visibility")                  # scope legacy|demo · action hide|show (reversible)
 def demo_visibility(i: DemoVisIn, u=Depends(current_user)): return _wrap(demo_seed.set_visibility, u, i.scope, i.action)
 @app.get("/api/debates/{did}/myrole")
