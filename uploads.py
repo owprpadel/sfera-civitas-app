@@ -142,15 +142,26 @@ def file_meta(file_name, data_b64=None, size=None) -> dict:
     return {"file_name": file_name, "file_type": label_of(file_name), "size": int(n or 0)}
 
 
-def headers_for(file_name: str) -> dict:
-    """Cabeceras seguras de descarga."""
+VIEWABLE = {"pdf", "png", "jpg", "jpeg"}   # se pueden VER en el navegador (?ver=1); el resto siempre se descarga
+
+
+def headers_for(file_name: str, inline: bool = False) -> dict:
+    """Cabeceras seguras. Por defecto, descarga. Con inline=True y solo para PDF e
+    imágenes (contenido ya comprobado al subir), se abre para verlo en el navegador:
+    en el móvil la app lo abre fuera (Safari / visor), con su botón para volver."""
     from urllib.parse import quote
     name = safe_name(file_name)
     ascii_name = name.encode("ascii", "ignore").decode("ascii").replace('"', "") or "documento"
-    return {
-        "Content-Disposition": f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(name)}",
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    show = inline and ext in VIEWABLE
+    h = {
+        "Content-Disposition": f"{'inline' if show else 'attachment'}; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(name)}",
         "X-Content-Type-Options": "nosniff",
-        "Content-Security-Policy": "default-src 'none'; sandbox",
         "Cache-Control": "private, max-age=300",
         "Referrer-Policy": "no-referrer",
     }
+    # Imágenes y descargas: documento aislado (sin scripts). PDF visible: el visor del navegador
+    # no admite «sandbox», así que se limita todo lo demás (sin red, sin formularios).
+    h["Content-Security-Policy"] = ("default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; object-src 'self'; frame-ancestors 'self'"
+                                    if (show and ext == "pdf") else "default-src 'none'; img-src 'self'; sandbox")
+    return h

@@ -474,14 +474,14 @@ def add_ep_doc(epid: int, i: EPDocIn, u=Depends(current_user)):
         return ds.create_document(r["debate_id"], u, i.doc_type, title, i.content_kind, i.content_text,
                                   i.file_name, i.mime_type, i.data_b64, "publicado", i.author_profile_id, epid, i.formal)
     return _wrap(_go)
-def _file_response(raw: bytes, name: str, ctype: str) -> Response:
-    return Response(content=raw, media_type=ctype, headers=uploads.headers_for(name))
-@app.get("/api/files/doc/{doc_id}")                      # descarga de un archivo de experto (?v=versión)
-def download_doc(doc_id: int, v: Optional[int] = None):
-    return _file_response(*_wrap(ds.file_content, doc_id, v))
-@app.get("/api/files/cdoc/{cid}")                        # descarga de un archivo de la ciudadanía
-def download_cdoc(cid: int, u=Depends(optional_user)):
-    return _file_response(*_wrap(cdocs.file_content, cid, u))
+def _file_response(raw: bytes, name: str, ctype: str, inline: bool = False) -> Response:
+    return Response(content=raw, media_type=ctype, headers=uploads.headers_for(name, inline))
+@app.get("/api/files/doc/{doc_id}")                      # archivo de experto (?v=versión · ?ver=1 para verlo: PDF/imagen)
+def download_doc(doc_id: int, v: Optional[int] = None, ver: int = 0):
+    return _file_response(*_wrap(ds.file_content, doc_id, v), inline=bool(ver))
+@app.get("/api/files/cdoc/{cid}")                        # archivo de la ciudadanía (?ver=1 para verlo: PDF/imagen)
+def download_cdoc(cid: int, ver: int = 0, u=Depends(optional_user)):
+    return _file_response(*_wrap(cdocs.file_content, cid, u), inline=bool(ver))
 # ── Casos de demostración (Super Admin) ──
 @app.get("/api/admin/demo")
 def demo_status(u=Depends(current_user)): return _wrap(demo_seed.status, u)

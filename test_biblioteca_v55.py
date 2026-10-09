@@ -11,6 +11,7 @@ import base64
 import io
 import json
 import os
+os.environ.setdefault("SFERA_CERT_SIM_ALLOWED", "1")  # simulación de certificado solo en tests
 import secrets
 import zipfile
 
@@ -275,6 +276,16 @@ expect_error(lambda: cd.add_doc(d2, u[3], "dato", "Archivo 3", "", "", file_name
              "3er archivo del día: límite alcanzado", "Inténtalo mañana")
 check(cd.add_doc(d2, u[3], "dato", "Solo texto", "Sin archivo")["ok"], "sin archivo sí puede seguir aportando")
 uploads.MAX_FILES_PER_DAY = _old
+
+# ── v58: ver PDF/imagen sin quedarse atrapado en la app (inline solo para PDF e imágenes) ──
+_h = uploads.headers_for("informe.pdf", True)
+check(_h["Content-Disposition"].startswith("inline") and "sandbox" not in _h["Content-Security-Policy"], "PDF con ?ver=1: se abre para verlo")
+_h = uploads.headers_for("foto.jpg", True)
+check(_h["Content-Disposition"].startswith("inline") and "sandbox" in _h["Content-Security-Policy"], "imagen con ?ver=1: se ve, aislada")
+_h = uploads.headers_for("hoja.xlsx", True)
+check(_h["Content-Disposition"].startswith("attachment"), "Excel con ?ver=1: sigue siendo descarga")
+_h = uploads.headers_for("informe.pdf")
+check(_h["Content-Disposition"].startswith("attachment") and "sandbox" in _h["Content-Security-Policy"], "sin ?ver: descarga aislada")
 
 print(f"\nRESULTADO biblioteca v55: {PASSED} OK · {FAILED} fallos")
 raise SystemExit(1 if FAILED else 0)
