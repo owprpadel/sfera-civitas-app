@@ -530,6 +530,30 @@ def _assign_profile(conn, did, pid, admin, at):
 
 
 def _seed_case(admin, c, citizens) -> dict:
+    """Crea un caso completo. v59: el asunto nace OCULTO y sin demo_key; solo al terminar
+    TODO se le pone la demo_key y se muestra. Si algo falla a medias, el asunto parcial queda
+    archivado (oculto, sin demo_key) y la siguiente ejecución vuelve a crear el caso entero."""
+    holder = {}
+    try:
+        out = _seed_case_body(admin, c, citizens, holder)
+    except Exception:
+        did = holder.get("did")
+        if did:
+            try:
+                with db.session() as conn:
+                    conn.execute("UPDATE debates SET hidden=1, demo_key=NULL, demo_archived=0 WHERE id=?", (did,))
+                    conn.commit()
+            except Exception:
+                pass
+        raise
+    with db.session() as conn:
+        conn.execute("UPDATE debates SET demo_key=?, hidden=0 WHERE id=?",
+                     (f"demo-{DEMO_VERSION}-{c['key']}", out["did"]))
+        conn.commit()
+    return out
+
+
+def _seed_case_body(admin, c, citizens, holder) -> dict:
     """Crea un caso completo. Devuelve {did, pending_close}. Sin papeletas del servidor."""
     import service as s
     import docs_service as ds
@@ -541,10 +565,12 @@ def _seed_case(admin, c, citizens) -> dict:
     with db.session() as conn:
         cur = conn.execute(
             "INSERT INTO debates(title,body,materia,administracion,nivel,territorio,phase,visibility,created_by,conv_status,"
-            "conv_deadline,created,hidden,is_demo,demo_key,plan) VALUES(?,?,?,?,?,?,'convocar','public',?,'recabando',?,?,0,1,?,'estandar')",
+            "conv_deadline,created,hidden,is_demo,demo_key,plan) VALUES(?,?,?,?,?,?,'convocar','public',?,'recabando',?,?,1,1,NULL,'estandar')",
             (c["title"], c["body"], c["materia"], c["administracion"], c["nivel"], c["territorio"], creator,
-             created + s.CONV_DIAS * DAY, created, key), returning=True)
+             created + s.CONV_DIAS * DAY, created), returning=True)
         did = int(cur.lastrowid)
+        holder["did"] = did
+        conn.commit()
         # Apoyos de convocatoria (ciudadanía ficticia). Pasado Convocar: por encima del quórum real.
         n_sup = min(int(c.get("supports", 0)), len(citizens))
         for i, uid in enumerate(citizens[:n_sup]):

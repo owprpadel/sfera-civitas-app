@@ -32,6 +32,9 @@ TARGETS = {
     "citizen_doc": ("citizen_docs", "user_id", "title"),
     "document": ("documents", "created_by", "title"),      # documentos de expertos (v55: también archivos)
 }
+# v59: estos contenidos NUNCA se ocultan solos por número de denuncias (los publican expertos
+# o la administración y forman parte de la papeleta/biblioteca): solo moderación manual.
+NO_AUTO_HIDE = ("expert_proposal", "document")
 # Estados en content_moderation que retiran el contenido de las vistas públicas.
 HIDDEN_STATES = ("auto_hidden", "hidden", "removed")
 
@@ -81,16 +84,38 @@ def _target(conn, target_type: str, target_id: int):
     return dict(row)
 
 
+def _target_debate_id(conn, target_type: str, target_id: int):
+    """Asunto al que pertenece un contenido (para comprobar que quien denuncia puede verlo)."""
+    if target_type == "debate":
+        return int(target_id)
+    if target_type == "contribution":
+        r = conn.execute("SELECT d.debate_id AS did FROM document_contributions c JOIN documents d ON d.id=c.document_id "
+                         "WHERE c.id=?", (target_id,)).fetchone()
+    else:
+        table = TARGETS[target_type][0]
+        r = conn.execute(f"SELECT debate_id AS did FROM {table} WHERE id=?", (target_id,)).fetchone()
+    return int(dict(r)["did"]) if r and dict(r)["did"] is not None else None
+
+
 # ── Denunciar ─────────────────────────────────────────────────────────────────
 def report_content(user, target_type: str, target_id: int, reason: str, text: str = "") -> dict:
+    import service as _s
+    _s._require_verified(user)                 # v59: solo cuentas con el email verificado
     if reason not in REASONS:
         raise SferaError(400, "Elige un motivo de la lista")
     text = (text or "").strip()[:1000]
     now = db.now()
     with db.session() as conn:
         t = _target(conn, target_type, target_id)
+        did = _target_debate_id(conn, target_type, target_id)
+        if did is not None:
+            _s._visible_debate(conn, did, user)    # v59: solo se denuncia lo que uno puede ver
         if t["author_id"] is not None and int(t["author_id"]) == int(user["id"]):
             raise SferaError(400, "No puedes denunciar tu propio contenido")
+        # Comprobar ANTES de insertar (en Postgres un error de integridad anula la transacción).
+        if conn.execute("SELECT 1 FROM reports WHERE reporter_id=? AND target_type=? AND target_id=?",
+                        (user["id"], target_type, target_id)).fetchone():
+            raise SferaError(409, "Ya habías denunciado este contenido; está en revisión")
         try:
             conn.execute("""INSERT INTO reports(reporter_id,target_type,target_id,target_user_id,reason,text,status,created)
                             VALUES(?,?,?,?,?,?,'pending',?)""",
@@ -104,7 +129,7 @@ def report_content(user, target_type: str, target_id: int, reason: str, text: st
                            (target_type, target_id)).fetchone()
         cur_status = cur["status"] if cur else None
         auto_hidden = False
-        if n >= REPORT_THRESHOLD and cur_status not in HIDDEN_STATES:
+        if n >= REPORT_THRESHOLD and cur_status not in HIDDEN_STATES and target_type not in NO_AUTO_HIDE:
             if cur:
                 conn.execute("UPDATE content_moderation SET status='auto_hidden', updated=?, updated_by=NULL "
                              "WHERE target_type=? AND target_id=?", (now, target_type, target_id))
@@ -118,6 +143,12 @@ def report_content(user, target_type: str, target_id: int, reason: str, text: st
                              (a["id"], "moderacion", target_id if target_type == "debate" else None,
                               f"Contenido oculto por denuncias ({target_type} #{target_id}): pendiente de revisión.",
                               now))
+        elif n == REPORT_THRESHOLD and target_type in NO_AUTO_HIDE:
+            # No se oculta solo: se avisa a la administración para que lo revise a mano.
+            for a in conn.execute("SELECT id FROM users WHERE is_admin=1").fetchall():
+                conn.execute("INSERT INTO notifications(user_id,kind,debate_id,text,created) VALUES(?,?,?,?,?)",
+                             (a["id"], "moderacion", None,
+                              f"Contenido de expertos con varias denuncias ({target_type} #{target_id}): revísalo.", now))
         conn.commit()
     return {"ok": True, "reports": n, "hidden": auto_hidden or cur_status in HIDDEN_STATES,
             "threshold": REPORT_THRESHOLD}

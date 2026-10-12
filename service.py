@@ -58,8 +58,8 @@ VIAS = ("open", "verified")
 # «Los expertos guían, no deciden»: decide la ciudadanía votando.
 # No hay cron: el avance es PEREZOSO (se aplica al leer o escribir un asunto),
 # idempotente y a prueba de concurrencia (bloqueo de fila + UPDATE condicional).
-# Los plazos encadenados se calculan desde el vencimiento anterior, de modo que
-# un asunto que nadie ha abierto en semanas se pone al día correctamente.
+# Los plazos encadenados se calculan desde max(vencimiento anterior, ahora) (v59): un
+# asunto que nadie ha abierto en semanas pasa de fase y la nueva fase dura completa.
 DELIB_DIAS = int(os.environ.get("SFERA_DELIB_DIAS", "14"))
 PROP_DIAS = int(os.environ.get("SFERA_PROP_DIAS", "14"))
 PROP_EXT_DIAS = int(os.environ.get("SFERA_PROP_EXT_DIAS", "7"))   # ampliación automática si no hay propuestas expertas
@@ -159,9 +159,15 @@ def _user_via(user: dict) -> str:
     return "verificado" if (user.get("loa") == "verified") else "abierto"
 
 
-def _conv_counts(conn, did) -> tuple:
-    ab = conn.execute("SELECT COUNT(*) AS n FROM supports WHERE debate_id=? AND via='abierto'", (did,)).fetchone()
-    ve = conn.execute("SELECT COUNT(*) AS n FROM supports WHERE debate_id=? AND via='verificado'", (did,)).fetchone()
+def _conv_counts(conn, did, deadline=None) -> tuple:
+    """Apoyos por vía. Con `deadline`, solo cuentan los dados ANTES del fin del plazo (v59)."""
+    extra, params = "", ()
+    if deadline is not None:
+        extra, params = " AND (created IS NULL OR created<=?)", (float(deadline),)
+    ab = conn.execute("SELECT COUNT(*) AS n FROM supports WHERE debate_id=? AND via='abierto'" + extra,
+                      (did, *params)).fetchone()
+    ve = conn.execute("SELECT COUNT(*) AS n FROM supports WHERE debate_id=? AND via='verificado'" + extra,
+                      (did, *params)).fetchone()
     return (int(dict(ab)["n"]) if ab else 0, int(dict(ve)["n"]) if ve else 0)
 
 
@@ -170,11 +176,12 @@ def _conv_apply(conn, d, persist=True) -> dict:
     avanzar (a 'deliberar') o caducar. Devuelve los campos de convocatoria
     para adjuntar al asunto. Idempotente."""
     did = d["id"]
-    ab, ve = _conv_counts(conn, did)
-    qa, qv = _quorums(d)
     phase = d["phase"]
     conv_status = d["conv_status"] if "conv_status" in d.keys() else "recabando"
     deadline = d["conv_deadline"] if "conv_deadline" in d.keys() else None
+    # v59: mientras reúne apoyos, solo cuentan los apoyos dados dentro del plazo.
+    ab, ve = _conv_counts(conn, did, deadline if phase == "convocar" else None)
+    qa, qv = _quorums(d)
     qual = d["qualified_track"] if "qualified_track" in d.keys() else None
     if phase == "convocar" and conv_status == "recabando":
         if ab >= qa or ve >= qv:
@@ -359,6 +366,11 @@ def _admin_recipients(conn, d) -> list:
     out = {}
     for r in conn.execute("SELECT id,email FROM users WHERE is_admin=1").fetchall():
         rr = dict(r); out[rr["id"]] = rr["email"]
+    if _get(d, "org_id"):   # v59: asunto PRIVADO → su organizador (no los admins por ámbito)
+        for r in conn.execute("SELECT u.id AS id, u.email AS email FROM org_members m JOIN users u ON u.id=m.user_id "
+                              "WHERE m.org_id=? AND m.role='owner'", (_get(d, "org_id"),)).fetchall():
+            rr = dict(r); out[rr["id"]] = rr["email"]
+        return list(out.items())
     adm = (d["administracion"] or ""); mat = (d["materia"] or "")
     rows = conn.execute(
         "SELECT u.id AS id, u.email AS email, g.scope_type AS st, g.scope_value AS sv "
@@ -414,6 +426,12 @@ UMBRAL = {"open": 100, "verified": 25}
 
 # ── Config de seguridad (entorno) ─────────────────────────────────────────────
 _SECRET = (os.environ.get("SFERA_SECRET") or "DEV-INSECURE-SECRET-cambiar-en-produccion").encode()
+if not os.environ.get("SFERA_SECRET") and db.BACKEND == "postgres":   # v59: aviso RUIDOSO (no se cae el arranque)
+    import sys as _sys
+    print("\n" + "!" * 78 + "\n[sfera] PELIGRO: SFERA_SECRET NO está configurada en producción (Postgres).\n"
+          "[sfera] Se usa un secreto PÚBLICO: cualquiera podría falsificar sesiones y enlaces.\n"
+          "[sfera] Configura SFERA_SECRET en las variables de entorno del servidor (Render).\n" + "!" * 78 + "\n",
+          file=_sys.stderr, flush=True)
 TOKEN_TTL = 7 * 24 * 3600
 ADMIN_EMAILS = {e.strip().lower() for e in os.environ.get("SFERA_ADMIN_EMAILS", "").split(",") if e.strip()}
 # DEV=1 (por defecto) devuelve el código 2FA en la respuesta. En producción (=0) NO,
@@ -428,21 +446,98 @@ class SferaError(Exception):
         super().__init__(msg)
 
 
+VERIFY_EMAIL_MSG = "Verifica tu email para participar"
+
+
+def _require_verified(user) -> None:
+    """v59: una cuenta sin el email verificado puede ENTRAR (para verificarlo) pero no participar."""
+    if not user or not user.get("verified"):
+        raise SferaError(403, VERIFY_EMAIL_MSG)
+
+
+def _require_verified_uid(conn, uid) -> None:
+    r = conn.execute("SELECT verified FROM users WHERE id=?", (uid,)).fetchone()
+    if not r or not dict(r).get("verified"):
+        raise SferaError(403, VERIFY_EMAIL_MSG)
+
+
 # ── Sesiones firmadas ─────────────────────────────────────────────────────────
-def make_token(uid: int) -> str:
-    payload = f"{uid}.{int(time.time()) + TOKEN_TTL}"
+_VER_UNKNOWN = object()
+
+
+def _token_ver_of(uid) -> int:
+    """Versión de sesión ACTUAL de la cuenta (users.token_ver). None si la cuenta no existe."""
+    try:
+        with db.session() as conn:
+            r = conn.execute("SELECT token_ver FROM users WHERE id=?", (int(uid),)).fetchone()
+    except Exception as e:
+        # Columna aún sin migrar → versión 0 (como antes). Cualquier otro fallo (BD caída un
+        # momento) → "desconocida": NO se cierra la sesión por eso (get_user fallará con 5xx).
+        return 0 if "token_ver" in str(e) else _VER_UNKNOWN
+    if not r:
+        return None
+    return int(dict(r).get("token_ver") or 0)
+
+
+def make_token(uid: int, ver=None) -> str:
+    """Sesión firmada «uid.exp.ver.mac». ver = users.token_ver: al cambiar la contraseña o
+    borrar la cuenta sube y TODAS las sesiones anteriores dejan de valer (v59)."""
+    if ver is None:
+        _v = _token_ver_of(uid)
+        ver = _v if isinstance(_v, int) else 0
+    payload = f"{uid}.{int(time.time()) + TOKEN_TTL}.{int(ver)}"
     mac = hmac.new(_SECRET, payload.encode(), hashlib.sha256).hexdigest()
     return base64.urlsafe_b64encode(f"{payload}.{mac}".encode()).decode()
 
 
+# ── Enlaces firmados a UN archivo (v59) ──────────────────────────────────────
+# Un PDF de un espacio privado se abre FUERA de la app (Safari), donde no hay sesión.
+# Por eso el enlace lleva ?t=…: vale solo para ESE archivo, ESA persona y unas horas.
+FILE_TOKEN_TTL = 12 * 3600
+
+
+def make_file_token(uid: int, kind: str, fid: int, ttl: int = FILE_TOKEN_TTL) -> str:
+    exp = int(time.time()) + int(ttl)
+    mac = hmac.new(_SECRET, f"file:{kind}:{int(fid)}:{int(uid)}:{exp}".encode(), hashlib.sha256).hexdigest()[:40]
+    return f"{int(uid)}.{exp}.{mac}"
+
+
+def parse_file_token(token: str, kind: str, fid: int):
+    """uid si el enlace es válido para ese archivo y no ha caducado; si no, None."""
+    try:
+        uid, exp, mac = str(token or "").split(".")
+        good = hmac.new(_SECRET, f"file:{kind}:{int(fid)}:{int(uid)}:{int(exp)}".encode(), hashlib.sha256).hexdigest()[:40]
+        if not hmac.compare_digest(mac, good) or int(exp) < time.time():
+            return None
+        return int(uid)
+    except Exception:
+        return None
+
+
 def parse_token(token: str):
+    """uid si la sesión es válida, no ha caducado y su versión es la ACTUAL de la cuenta.
+    Compatibilidad: las sesiones del formato anterior «uid.exp.mac» valen como versión 0
+    (nadie se queda fuera con el despliegue) hasta que la cuenta cambie de contraseña."""
     try:
         raw = base64.urlsafe_b64decode(token.encode()).decode()
-        uid, exp, mac = raw.split(".")
-        good = hmac.new(_SECRET, f"{uid}.{exp}".encode(), hashlib.sha256).hexdigest()
+        parts = raw.split(".")
+        if len(parts) == 3:
+            uid, exp, mac = parts
+            ver = 0
+            signed = f"{uid}.{exp}"
+        elif len(parts) == 4:
+            uid, exp, ver, mac = parts
+            signed = f"{uid}.{exp}.{ver}"
+            ver = int(ver)
+        else:
+            return None
+        good = hmac.new(_SECRET, signed.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(mac, good):
             return None
         if int(exp) < time.time():
+            return None
+        cur = _token_ver_of(int(uid))
+        if cur is None or (cur is not _VER_UNKNOWN and int(cur) != int(ver)):
             return None
         return int(uid)
     except Exception:
@@ -519,21 +614,23 @@ def _send_2fa_email(to: str, code: str) -> bool:
 
 def resend_code(email: str) -> dict:
     """Reenvía un código de verificación NUEVO a una cuenta no verificada (rápido, async)."""
+    # v59: responde IGUAL exista o no la cuenta (y esté o no verificada): no revela qué
+    # emails están registrados. Un código nuevo invalida el anterior y reinicia los intentos.
     email = (email or "").strip().lower()
+    out = {"ok": True, "email_enviado": _mail_configured()}
+    code = None
     with db.session() as conn:
-        row = conn.execute("SELECT id, verified FROM users WHERE lower(email)=?", (email,)).fetchone()
-        if not row:
-            raise SferaError(404, "No hay ninguna cuenta con ese email")
-        row = dict(row)
-        if row.get("verified"):
-            return {"ok": True, "already_verified": True}
-        code = f"{secrets.randbelow(1000000):06d}"
-        conn.execute("UPDATE users SET twofa_code=? WHERE id=?", (code, row["id"]))
-        conn.commit()
-    sent = _send_2fa_email(email, code)
-    out = {"ok": True, "email_enviado": sent}
-    if not _mail_configured():
-        out["codigo_piloto"] = code
+        row = conn.execute("SELECT id, verified, email FROM users WHERE lower(email)=? ORDER BY id LIMIT 1",
+                           (email,)).fetchone()
+        row = dict(row) if row else None
+        if row and not row.get("verified") and not str(row.get("email") or "").endswith("@deleted.invalid"):
+            code = f"{secrets.randbelow(1000000):06d}"
+            conn.execute("UPDATE users SET twofa_code=?, twofa_attempts=0 WHERE id=?", (code, row["id"]))
+            conn.commit()
+    if code:
+        _send_2fa_email(email, code)
+        if not _mail_configured():
+            out["codigo_piloto"] = code   # modo piloto (sin correo): el código se muestra en la app
     return out
 
 
@@ -554,6 +651,7 @@ def delete_account(uid, password: str) -> dict:
         row = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
         if not row or not _verify_pw(password or "", row["pass_hash"]):
             raise SferaError(403, "Contraseña incorrecta")
+        _hand_over_orgs(conn, uid)          # v59: sus organizaciones no se quedan sin organizador
         for sql in ("DELETE FROM notifications WHERE user_id=?",
                     "DELETE FROM cert_challenges WHERE user_id=?",
                     "DELETE FROM org_members WHERE user_id=?",
@@ -567,10 +665,34 @@ def delete_account(uid, password: str) -> dict:
                 pass
         conn.execute(
             "UPDATE users SET email=?, pass_hash=?, verified=0, is_admin=0, is_expert=0, "
-            "cert_subject=NULL, cert_pid=NULL, cert_verified_at=NULL, twofa_code=NULL WHERE id=?",
+            "cert_subject=NULL, cert_pid=NULL, cert_verified_at=NULL, twofa_code=NULL, "
+            "token_ver=COALESCE(token_ver,0)+1 WHERE id=?",
             (f"deleted-{uid}@deleted.invalid", "deleted$" + _sec.token_hex(16), uid))
         conn.commit()
     return {"deleted": True}
+
+
+def _hand_over_orgs(conn, uid) -> None:
+    """Al borrar la cuenta de un ORGANIZADOR: el miembro más antiguo pasa a organizador
+    (org_members y organizations.owner_id). Si no queda nadie, la organización se deja igual."""
+    owned = {int(dict(r)["id"]) for r in conn.execute("SELECT id FROM organizations WHERE owner_id=?", (uid,)).fetchall()}
+    owned |= {int(dict(r)["org_id"]) for r in conn.execute(
+        "SELECT org_id FROM org_members WHERE user_id=? AND role='owner'", (uid,)).fetchall()}
+    for oid in sorted(owned):
+        others_owner = conn.execute("SELECT user_id FROM org_members WHERE org_id=? AND role='owner' AND user_id<>? "
+                                    "ORDER BY created, user_id LIMIT 1", (oid, uid)).fetchone()
+        nxt = others_owner or conn.execute(
+            "SELECT m.user_id AS user_id FROM org_members m JOIN users u ON u.id=m.user_id "
+            "WHERE m.org_id=? AND m.user_id<>? AND u.email NOT LIKE ? ORDER BY m.created, m.user_id LIMIT 1",
+            (oid, uid, "deleted-" + "%")).fetchone()
+        if not nxt:
+            continue
+        new_uid = int(dict(nxt)["user_id"])
+        conn.execute("UPDATE org_members SET role='owner' WHERE org_id=? AND user_id=?", (oid, new_uid))
+        conn.execute("UPDATE organizations SET owner_id=? WHERE id=?", (new_uid, oid))
+        org = conn.execute("SELECT name FROM organizations WHERE id=?", (oid,)).fetchone()
+        _notify(conn, new_uid, "org_owner", None,
+                f"Ahora organizas «{dict(org)['name'] if org else ''}»: la persona que la organizaba ha borrado su cuenta.")
 
 
 # ── Cuenta demo para revisión de tiendas (App Store / Google Play) ────────────
@@ -581,10 +703,12 @@ def ensure_demo_account() -> dict:
     la contraseña. Credenciales por entorno (SFERA_DEMO_EMAIL / SFERA_DEMO_PASSWORD)
     con valores por defecto para que funcione sin configurar nada. Cuenta 'open',
     NO admin, sin privilegios especiales."""
+    # v59: la contraseña YA NO está en el código. Sin SFERA_DEMO_PASSWORD no se crea ni se
+    # toca nada (la cuenta que exista se queda exactamente como está).
     email = (os.environ.get("SFERA_DEMO_EMAIL", "demo@sferacivitas.org") or "").strip().lower()
-    password = os.environ.get("SFERA_DEMO_PASSWORD", "SferaDemo-2026")
+    password = os.environ.get("SFERA_DEMO_PASSWORD") or ""
     if not email or not password:
-        return {"demo": False, "reason": "sin credenciales"}
+        return {"demo": False, "reason": "SFERA_DEMO_PASSWORD sin configurar: no se toca la cuenta demo"}
     try:
         with db.session() as conn:
             row = conn.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
@@ -615,10 +739,11 @@ def register(email: str, password: str) -> dict:
         if conn.execute("SELECT 1 FROM users WHERE lower(email)=?", (email,)).fetchone():
             raise SferaError(400, "Email ya registrado")
         code = f"{secrets.randbelow(1000000):06d}"
-        adm = 1 if email.lower() in ADMIN_EMAILS else 0
+        # v59: NUNCA admin antes de verificar el email (lo concede verify()).
         cur = conn.execute(
-            "INSERT INTO users(email,pass_hash,verified,loa,is_admin,twofa_code,created) VALUES(?,?,0,'open',?,?,?)",
-            (email, _hash_pw(password), adm, code, db.now()), returning=True)
+            "INSERT INTO users(email,pass_hash,verified,loa,is_admin,twofa_code,twofa_attempts,created) "
+            "VALUES(?,?,0,'open',0,?,0,?)",
+            (email, _hash_pw(password), code, db.now()), returning=True)
         conn.commit()
         uid = cur.lastrowid
     sent = _send_2fa_email(email, code)
@@ -631,16 +756,41 @@ def register(email: str, password: str) -> dict:
     return out
 
 
+VERIFY_MAX_TRIES = 5
+TOO_MANY_CODE_MSG = "Demasiados intentos: pide un código nuevo"
+
+
 def verify(email: str, code: str) -> dict:
+    """Comprueba el código del email. v59: máximo VERIFY_MAX_TRIES fallos por código; al
+    llegar, el código se anula (hay que pedir otro). Concede admin (SFERA_ADMIN_EMAILS)
+    solo aquí, con el email ya demostrado."""
     email = (email or "").strip().lower()
+    code = re.sub(r"\s", "", str(code or ""))
     with db.session() as conn:
         row = conn.execute("SELECT * FROM users WHERE lower(email)=? ORDER BY id LIMIT 1", (email,)).fetchone()
-        if not row or not row["twofa_code"] or not hmac.compare_digest(str(row["twofa_code"]), str(code)):
+        row = dict(row) if row else None
+        if not row or not row.get("twofa_code"):
             raise SferaError(400, "Código incorrecto")
-        conn.execute("UPDATE users SET verified=1, twofa_code=NULL WHERE id=?", (row["id"],))
+        tries = int(row.get("twofa_attempts") or 0)
+        if tries >= VERIFY_MAX_TRIES:
+            conn.execute("UPDATE users SET twofa_code=NULL WHERE id=?", (row["id"],))
+            conn.commit()
+            raise SferaError(400, TOO_MANY_CODE_MSG)
+        if not hmac.compare_digest(str(row["twofa_code"]), code):
+            tries += 1
+            if tries >= VERIFY_MAX_TRIES:
+                conn.execute("UPDATE users SET twofa_code=NULL, twofa_attempts=? WHERE id=?", (tries, row["id"]))
+                conn.commit()
+                raise SferaError(400, TOO_MANY_CODE_MSG)
+            conn.execute("UPDATE users SET twofa_attempts=? WHERE id=?", (tries, row["id"]))
+            conn.commit()
+            raise SferaError(400, "Código incorrecto")
+        adm = 1 if (row.get("is_admin") or email in ADMIN_EMAILS) else 0
+        conn.execute("UPDATE users SET verified=1, twofa_code=NULL, twofa_attempts=0, is_admin=? WHERE id=?",
+                     (adm, row["id"]))
         conn.commit()
         loa = row["loa"]
-    return {"verified": True, "loa": loa}
+    return {"verified": True, "loa": loa, "is_admin": bool(adm)}
 
 
 def verify_certificate(email: str, cert_subject: str) -> dict:
@@ -679,11 +829,11 @@ def login(email: str, password: str) -> dict:
         if not str(row["pass_hash"]).startswith("scrypt$"):
             conn.execute("UPDATE users SET pass_hash=? WHERE id=?", (_hash_pw(password), row["id"]))
         is_admin = bool(d.get("is_admin"))
-        if email.lower() in ADMIN_EMAILS and not is_admin:
+        if email.lower() in ADMIN_EMAILS and not is_admin and d.get("verified"):   # v59: solo con email verificado
             conn.execute("UPDATE users SET is_admin=1 WHERE id=?", (row["id"],))
             is_admin = True
         conn.commit()
-    return {"token": make_token(row["id"]), "user_id": row["id"],
+    return {"token": make_token(row["id"], int(d.get("token_ver") or 0)), "user_id": row["id"],
             "verified": bool(row["verified"]), "loa": row["loa"],
             "is_admin": is_admin, "email": d.get("email") or email}
 
@@ -720,6 +870,8 @@ def forgot_password(email: str) -> dict:
         if not row:
             return out
         code = f"{secrets.randbelow(1000000):06d}"
+        # Un código nuevo SUSTITUYE al anterior (el viejo deja de valer) y trae sus propios
+        # RESET_MAX_TRIES intentos; pedir códigos está limitado por IP en main.py.
         conn.execute("UPDATE users SET reset_code_hash=?, reset_expires=?, reset_attempts=0 WHERE id=?",
                      (_reset_hash(row["id"], code), db.now() + RESET_MIN * 60, row["id"]))
         conn.commit()
@@ -749,7 +901,8 @@ def reset_password(email: str, code: str, new_password: str) -> dict:
             raise bad
         # El código llega al email: queda también demostrado que el email es suyo.
         conn.execute("UPDATE users SET pass_hash=?, reset_code_hash=NULL, reset_expires=NULL, reset_attempts=0, "
-                     "verified=1, twofa_code=NULL WHERE id=?", (_hash_pw(new_password), row["id"]))
+                     "verified=1, twofa_code=NULL, twofa_attempts=0, token_ver=COALESCE(token_ver,0)+1 WHERE id=?",
+                     (_hash_pw(new_password), row["id"]))   # v59: cierra las sesiones abiertas
         conn.commit()
     return {"ok": True}
 
@@ -761,9 +914,11 @@ def change_password(uid, old_password: str, new_password: str) -> dict:
         row = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
         if not row or not _verify_pw(old_password, row["pass_hash"]):
             raise SferaError(403, "Contraseña actual incorrecta")
-        conn.execute("UPDATE users SET pass_hash=? WHERE id=?", (_hash_pw(new_password), uid))
+        ver = int(dict(row).get("token_ver") or 0) + 1      # v59: cierra las demás sesiones
+        conn.execute("UPDATE users SET pass_hash=?, token_ver=? WHERE id=?", (_hash_pw(new_password), ver, uid))
         conn.commit()
-    return {"ok": True}
+    # Sesión NUEVA para este dispositivo (la anterior deja de valer): la app debe guardarla.
+    return {"ok": True, "token": make_token(uid, ver)}
 
 
 # ── Debates / fases ──────────────────────────────────────────────────────────
@@ -780,6 +935,7 @@ def _org_role(conn, org_id, user_id):
 
 def create_org(user, name: str) -> dict:
     """Crea una organización privada; el creador es 'owner' (organizador)."""
+    _require_verified(user)
     if not (name or "").strip():
         raise SferaError(400, "La organización necesita un nombre")
     now = db.now()
@@ -806,6 +962,7 @@ def list_my_orgs(user) -> list:
 def invite_member(user, org_id: int, email: str) -> dict:
     """El organizador (owner) invita a alguien por email al censo. Si ya tiene
     cuenta, se añade directamente; si no, queda invitación pendiente + email."""
+    _require_verified(user)
     email = (email or "").strip().lower()
     if not email:
         raise SferaError(400, "Falta el email a invitar")
@@ -816,15 +973,14 @@ def invite_member(user, org_id: int, email: str) -> dict:
         org = conn.execute("SELECT name FROM organizations WHERE id=?", (org_id,)).fetchone()
         if not org:
             raise SferaError(404, "Organización inexistente")
-        u = conn.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
+        u = conn.execute("SELECT id FROM users WHERE lower(email)=? ORDER BY id LIMIT 1", (email,)).fetchone()
         if u:
-            try:
+            # Comprobar ANTES de insertar (en Postgres un error de integridad anula la transacción).
+            if not _is_org_member(conn, org_id, dict(u)["id"]):
                 conn.execute("INSERT INTO org_members(org_id,user_id,role,created) VALUES(?,?,'member',?)",
                              (org_id, dict(u)["id"], now))
                 _notify(conn, dict(u)["id"], "org_invite", None,
                         f"Te han añadido a la organización «{dict(org)['name']}» en Sfera Civitas.")
-            except db.INTEGRITY_ERRORS:
-                pass
             conn.commit()
             _send_email(email, f"[Sfera Civitas] Te han añadido a «{dict(org)['name']}»",
                         f"Ya formas parte de la organización «{dict(org)['name']}» en Sfera Civitas. Entra en {APP_URL} para participar en sus asuntos privados.")
@@ -843,18 +999,21 @@ def invite_member(user, org_id: int, email: str) -> dict:
     return out
 
 
+INVITE_TTL_DIAS = 30
+
+
 def accept_invite(user, token: str) -> dict:
     now = db.now()
     with db.session() as conn:
-        inv = conn.execute("SELECT * FROM org_invites WHERE token=? AND used=0", (token,)).fetchone()
+        inv = conn.execute("SELECT * FROM org_invites WHERE token=? AND used=0", (token or "",)).fetchone()
         if not inv:
             raise SferaError(404, "Invitación no válida o ya usada")
         inv = dict(inv)
-        try:
+        if float(inv.get("created") or 0) < now - INVITE_TTL_DIAS * 86400:   # v59: caducan a los 30 días
+            raise SferaError(410, "Esta invitación ha caducado: pide a quien organiza que te invite de nuevo")
+        if not _is_org_member(conn, inv["org_id"], user["id"]):      # comprobar antes (Postgres)
             conn.execute("INSERT INTO org_members(org_id,user_id,role,created) VALUES(?,?,'member',?)",
                          (inv["org_id"], user["id"], now))
-        except db.INTEGRITY_ERRORS:
-            pass
         conn.execute("UPDATE org_invites SET used=1 WHERE id=?", (inv["id"],))
         conn.commit()
     return {"ok": True, "org_id": inv["org_id"]}
@@ -989,6 +1148,8 @@ def handle_webhook(provider: str, headers: dict, raw: bytes) -> dict:
     idempotente y acredita unidades de uso a la organización. Nunca confía en el
     cuerpo sin verificar la firma del proveedor."""
     provider = (provider or BILLING_PROVIDER).lower()
+    if provider != BILLING_PROVIDER:      # v59: solo el proveedor CONFIGURADO puede acreditar pagos
+        raise SferaError(400, "Proveedor de pago no configurado")
     hdr = {k.lower(): v for k, v in (headers or {}).items()}
     if provider == "lemonsqueezy":
         if not _verify_ls_signature(raw, hdr.get("x-signature", "")):
@@ -1036,9 +1197,8 @@ def handle_webhook(provider: str, headers: dict, raw: bytes) -> dict:
         return _record_payment(provider, ext_id, "paid", 0, PRICE_CURRENCY,
                                max(1, PRICE_UNITS_PER_PURCHASE), None, org_id, raw)
     if provider == "polar":
-        if POLAR_WEBHOOK_SECRET and not hmac.compare_digest(
-                hmac.new(POLAR_WEBHOOK_SECRET.encode(), raw, hashlib.sha256).hexdigest(),
-                (hdr.get("webhook-signature", "") or "").strip()):
+        # v59: sin secreto configurado o con firma inválida → 401 (antes, sin secreto se aceptaba todo).
+        if not _verify_standard_webhook(POLAR_WEBHOOK_SECRET, hdr, raw):
             raise SferaError(401, "Firma de webhook no válida")
         try:
             body = json.loads(raw.decode())
@@ -1055,6 +1215,47 @@ def handle_webhook(provider: str, headers: dict, raw: bytes) -> dict:
         return _record_payment(provider, ext_id, "paid", 0, PRICE_CURRENCY,
                                max(1, PRICE_UNITS_PER_PURCHASE), None, org_id, raw)
     raise SferaError(400, "Proveedor de pago desconocido")
+
+
+WEBHOOK_TOLERANCE = 5 * 60   # segundos de margen del sello de tiempo (anti-reenvío)
+
+
+def _standard_webhook_key(secret: str) -> bytes:
+    """Clave HMAC de Standard Webhooks. «whsec_<base64>» → bytes decodificados; cualquier
+    otro valor (así lo entrega Polar) → los bytes del propio texto del secreto."""
+    secret = (secret or "").strip()
+    if secret.startswith("whsec_"):
+        try:
+            return base64.b64decode(secret[len("whsec_"):])
+        except Exception:
+            return secret.encode()
+    return secret.encode()
+
+
+def _verify_standard_webhook(secret: str, hdr: dict, raw: bytes, now=None) -> bool:
+    """Standard Webhooks (Polar): cabeceras webhook-id, webhook-timestamp y
+    webhook-signature = «v1,<base64(HMAC-SHA256(clave, id.timestamp.cuerpo))>» (puede
+    haber varias separadas por espacios). Sin secreto → False."""
+    if not secret:
+        return False
+    wid = (hdr.get("webhook-id") or "").strip()
+    ts = (hdr.get("webhook-timestamp") or "").strip()
+    sigs = (hdr.get("webhook-signature") or "").strip()
+    if not (wid and ts and sigs):
+        return False
+    try:
+        tsi = int(ts)
+    except Exception:
+        return False
+    if abs((now if now is not None else time.time()) - tsi) > WEBHOOK_TOLERANCE:
+        return False
+    signed = wid.encode() + b"." + ts.encode() + b"." + (raw or b"")
+    calc = base64.b64encode(hmac.new(_standard_webhook_key(secret), signed, hashlib.sha256).digest()).decode()
+    for part in sigs.split():
+        ver, _, val = part.partition(",")
+        if ver == "v1" and val and hmac.compare_digest(val, calc):
+            return True
+    return False
 
 
 def _verify_paddle_signature(raw: bytes, header: str) -> bool:
@@ -1107,6 +1308,7 @@ def create_debate(title, body, materia, administracion, user, nivel="", territor
     · PLAN: 'estandar' (por defecto) o 'express' (solo administración). quorum_override
       (solo administración) rebaja el quórum de apoyos con email."""
     import roles
+    _require_verified(user)
     title = " ".join((title or "").split())
     if not title:
         raise SferaError(400, "El asunto necesita un título")
@@ -1172,6 +1374,8 @@ def set_plan(did: int, plan: str, user, quorum_override=None) -> dict:
     plan = (plan or "").strip().lower()
     if plan not in PLANS:
         raise SferaError(400, "Tipo de proceso no válido (estándar o exprés)")
+    # v59: sin quorum_override (None) se CONSERVA el que tuviera el asunto; 0 o "" lo quita.
+    keep_qo = quorum_override is None
     qo = None
     if quorum_override not in (None, "", 0):
         try:
@@ -1191,6 +1395,8 @@ def set_plan(did: int, plan: str, user, quorum_override=None) -> dict:
             raise SferaError(409, "El tipo de proceso solo se puede cambiar mientras el asunto está reuniendo apoyos (Convocar)")
         db.lock_row(conn, "debates", did)
         d = _row(conn, did)
+        if keep_qo:
+            qo = d.get("quorum_override")
         now = db.now()
         old = float(d.get("conv_deadline") or now)
         if plan == "express":
@@ -1217,15 +1423,16 @@ def support_debate(did: int, user) -> dict:
     """Apoyar un asunto en fase de convocatoria. Un apoyo por persona y asunto;
     cuenta en la vía del registro del usuario. Si con este apoyo se alcanza el
     umbral de alguna vía, el asunto avanza a Deliberar."""
+    _require_verified(user)
     via = _user_via(user)
     now = db.now()
     with db.session() as conn:
-        d = conn.execute("SELECT * FROM debates WHERE id=?", (did,)).fetchone()
-        if not d:
-            raise SferaError(404, "Este asunto no existe")
+        # v59: visibilidad (privado/moderación) + convocatoria al día (_conv_apply) ANTES de decidir.
+        d = _load_debate(conn, did, user=user)
         if d["phase"] != "convocar":
             raise SferaError(409, "Este asunto ya no está reuniendo apoyos")
-        if (d["conv_status"] if "conv_status" in d.keys() else None) == "caducado":
+        dl = d.get("conv_deadline")
+        if d.get("conv_status") == "caducado" or (dl is not None and now > float(dl)):
             raise SferaError(409, "Este asunto no reunió los apoyos a tiempo: ya no se puede apoyar")
         already = conn.execute("SELECT 1 FROM supports WHERE debate_id=? AND user_id=?", (did, user["id"])).fetchone()
         if not already:
@@ -1364,6 +1571,8 @@ def _expert_recipients(conn, d) -> list:
     for r in conn.execute("SELECT u.id AS id, u.email AS email FROM debate_experts de "
                           "JOIN users u ON u.id=de.user_id WHERE de.debate_id=?", (d["id"],)).fetchall():
         rr = dict(r); out[rr["id"]] = rr["email"]
+    if _get(d, "org_id"):   # v59: asunto PRIVADO → solo los expertos asignados
+        return list(out.items())
     adm = (_get(d, "administracion") or ""); mat = (_get(d, "materia") or "")
     for r in conn.execute("SELECT u.id AS id, u.email AS email, g.scope_type AS st, g.scope_value AS sv "
                           "FROM grants g JOIN users u ON u.id=g.user_id WHERE g.role='expert'").fetchall():
@@ -1503,10 +1712,14 @@ def _phase_apply(conn, did) -> None:
                 _open_vote(conn, d, new)         # 'votar' sin elección (legado): papeleta si hay propuestas expertas
             conn.commit(); continue
         dl = float(dl)
+        # v59: el plazo nuevo cuenta desde max(vencimiento anterior, ahora). Si nadie abrió el
+        # asunto en semanas, la fase siguiente dura igualmente lo que le toca (una votación
+        # nunca se abre y se cierra en la misma petición).
+        base = max(dl, now)
         if ph == "deliberar":
             cur = conn.execute("UPDATE debates SET phase='proponer', phase_deadline=? "
                                "WHERE id=? AND phase='deliberar' AND phase_deadline=?",
-                               (dl + _pd(d, "proponer") * 86400, did, d["phase_deadline"]))
+                               (base + _pd(d, "proponer") * 86400, did, d["phase_deadline"]))
             if cur.rowcount != 0:
                 _on_proponer(conn, d)
             conn.commit(); continue
@@ -1517,7 +1730,7 @@ def _phase_apply(conn, did) -> None:
                                       (did,)).fetchone()
                 if int(dict(n_auto)["n"]) == 0:
                     ext = _ext_dias(d)
-                    new = dl + ext * 86400
+                    new = base + ext * 86400
                     cur = conn.execute("UPDATE debates SET phase_deadline=? WHERE id=? AND phase='proponer' AND phase_deadline=?",
                                        (new, did, d["phase_deadline"]))
                     if cur.rowcount != 0:
@@ -1536,7 +1749,7 @@ def _phase_apply(conn, did) -> None:
                                   admins=True, experts=True,
                                   email_subject=f"[Sfera Civitas] Asunto detenido sin propuestas de expertos: «{d['title']}»")
                 conn.commit(); return
-            new = dl + _pd(d, "votar") * 86400
+            new = base + _pd(d, "votar") * 86400
             cur = conn.execute("UPDATE debates SET phase='votar', phase_deadline=?, cierre=? "
                                "WHERE id=? AND phase='proponer' AND phase_deadline=?",
                                (new, new, did, d["phase_deadline"]))
@@ -1598,14 +1811,28 @@ def _safe_refresh(conn, d) -> dict:
         return out
 
 
-def _load_debate(conn, did, user=None, uid=None):
-    """Asunto existente y accesible (privado: solo su censo), ya puesto al día."""
-    d = _row(conn, did)
-    if not d:
-        raise SferaError(404, "Este asunto no existe")
-    oid = d.get("org_id")
-    who = uid if uid is not None else (user["id"] if user else None)
-    if oid and not (who and _is_org_member(conn, oid, who)):
+def _user_by_id(conn, uid):
+    if uid is None:
+        return None
+    r = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    return dict(r) if r else None
+
+
+def _is_debate_expert(conn, did, uid) -> bool:
+    return bool(uid) and bool(conn.execute("SELECT 1 FROM debate_experts WHERE debate_id=? AND user_id=?",
+                                           (did, uid)).fetchone())
+
+
+def _load_debate(conn, did, user=None, uid=None, staff_ok=False):
+    """Asunto existente y accesible PARA ESCRIBIR, ya puesto al día (v59):
+    · oculto por moderación → 404 (salvo moderadores): no admite apoyos, argumentos, documentos…
+    · privado → solo su censo. Con staff_ok=True (acciones de experto/administración:
+      propuestas y documentos de expertos) también el Super Admin y los expertos asignados."""
+    if user is None and uid is not None:
+        user = _user_by_id(conn, uid)
+    d = _visible_debate(conn, did, user)
+    oid = _get(d, "org_id")
+    if oid and not staff_ok and not (user and _is_org_member(conn, oid, user["id"])):
         raise SferaError(403, "Asunto privado: solo para miembros de la organización")
     return _refresh(conn, d)
 
@@ -1636,12 +1863,14 @@ def _visible_debate(conn, did, user=None):
     d = conn.execute("SELECT * FROM debates WHERE id=?", (did,)).fetchone()
     if not d:
         raise SferaError(404, "Este asunto no existe")
+    did = int(d["id"])
     # MODERACIÓN: un asunto oculto (denuncias/moderador) solo lo ven los moderadores.
     if did in moderation.hidden_ids(conn, "debate") and not moderation.can_moderate(conn, user):
         raise SferaError(404, "Este asunto está oculto, pendiente de revisión de moderación")
-    # Asuntos PRIVADOS: solo visibles para el censo de su organización.
+    # Asuntos PRIVADOS: solo su censo (v59: y el Super Admin y los expertos ASIGNADOS a ese asunto).
     oid = d["org_id"] if "org_id" in d.keys() else None
-    if oid and not (user and _is_org_member(conn, oid, user["id"])):
+    if oid and not (user and (_is_org_member(conn, oid, user["id"]) or user.get("is_admin")
+                              or _is_debate_expert(conn, did, user["id"]))):
         raise SferaError(403, "Asunto privado: solo para miembros de la organización")
     return d
 
@@ -2121,6 +2350,7 @@ def add_argument(did, uid, stance, text) -> dict:
     if stance not in ("favor", "contra", "matiz"):
         stance = "matiz"
     with db.session() as conn:
+        _require_verified_uid(conn, uid)
         d = _load_debate(conn, did, uid=uid)
         _require_phase(d, "deliberar")
         cur = conn.execute("INSERT INTO arguments(debate_id,user_id,stance,text,created) VALUES(?,?,?,?,?)",
@@ -2135,6 +2365,7 @@ def add_proposal(did, uid, text) -> dict:
     if not text:
         raise SferaError(400, "Escribe tu propuesta")
     with db.session() as conn:
+        _require_verified_uid(conn, uid)
         d = _load_debate(conn, did, uid=uid)
         _require_phase(d, "proponer")
         cur = conn.execute("INSERT INTO proposals(debate_id,user_id,text,created) VALUES(?,?,?,?)",
@@ -2146,6 +2377,7 @@ def add_proposal(did, uid, text) -> dict:
 def support_proposal(pid: int, user) -> dict:
     """Apoyar una propuesta ciudadana (solo en PROPONER). Un apoyo por persona y propuesta."""
     import moderation
+    _require_verified(user)
     with db.session() as conn:
         p = conn.execute("SELECT * FROM proposals WHERE id=?", (pid,)).fetchone()
         if not p or int(pid) in moderation.hidden_ids(conn, "proposal"):
@@ -2179,6 +2411,7 @@ def toggle_util(kind: str, item_id: int, user, on=None) -> dict:
     import moderation
     if kind not in _UTIL:
         raise SferaError(400, "Tipo de contenido no válido")
+    _require_verified(user)
     table, utable, col, phase, nf = _UTIL[kind]
     with db.session() as conn:
         row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (item_id,)).fetchone()
@@ -2213,17 +2446,18 @@ def add_expert_proposal(did: int, user, title: str, text: str, justification: st
     expertos y administración: «Falta el documento formal»."""
     import roles
     import uploads
-    formal = uploads.validate(formal_file_name, formal_data_b64) if (formal_file_name or formal_data_b64) else None
     title = " ".join((title or "").split())
     text = (text or "").strip()
     justification = (justification or "").strip()
     with db.session() as conn:
-        d = _load_debate(conn, did, user=user)
+        d = _load_debate(conn, did, user=user, staff_ok=True)
         drow = _row(conn, did)
         if not roles.can_author(conn, user, drow):
             raise SferaError(403, "Solo los expertos asignados a este asunto (o su administración) pueden publicar propuestas de expertos")
         if d.get("phase") != "proponer":
             _require_phase(d, "proponer")
+        # v59: el archivo se valida DESPUÉS de comprobar permisos y fase (no se procesa nada ajeno).
+        formal = uploads.validate(formal_file_name, formal_data_b64) if (formal_file_name or formal_data_b64) else None
         if not title:
             raise SferaError(400, "Ponle un título a la propuesta (será una opción de la votación)")
         if len(title) > 160:
@@ -2277,7 +2511,7 @@ def withdraw_expert_proposal(epid: int, user) -> dict:
         if not p or int(dict(p).get("hidden") or 0):
             raise SferaError(404, "Esta propuesta de expertos no existe")
         p = dict(p)
-        d = _load_debate(conn, p["debate_id"], user=user)
+        d = _load_debate(conn, p["debate_id"], user=user, staff_ok=True)
         if not (int(p["author_id"]) == int(user["id"]) or roles.can_admin(conn, user, _row(conn, p["debate_id"]))):
             raise SferaError(403, "Solo su autor o la administración del asunto pueden retirarla")
         if d.get("phase") != "proponer":
@@ -2325,8 +2559,18 @@ def open_election(did, question, options, user, n_trustees: int = 3) -> dict:
 
 
 
-def election_public(eid: int) -> dict:
+def _visible_election(conn, eid, user=None):
+    """v59: una votación solo se ve si se puede ver su asunto (privado: solo su censo)."""
+    e = conn.execute("SELECT id, debate_id FROM elections WHERE id=?", (eid,)).fetchone()
+    if not e:
+        raise SferaError(404, "Esta votación no existe")
+    _visible_debate(conn, dict(e)["debate_id"], user)
+    return dict(e)
+
+
+def election_public(eid: int, user=None) -> dict:
     with db.session() as conn:
+        _visible_election(conn, eid, user)
         e = conn.execute("""SELECT id,debate_id,question,options_json,status,elgamal_pub_json,
                     blind_open_n,blind_open_e,blind_verified_n,blind_verified_e,result_json
                     FROM elections WHERE id=?""", (eid,)).fetchone()
@@ -2366,26 +2610,75 @@ def _election_gate(conn, eid, user=None):
     return e
 
 
+BAD_VOTE_MSG = "Tu voto no se ha podido leer. Vuelve a intentarlo."
+ALREADY_CRED_MSG = "Ya has pedido tu papeleta para esta votación"
+CERT_VIA_MSG = "Tu cuenta está verificada con certificado digital: vota con la opción de certificado"
+
+
+def _day(t: float) -> float:
+    """Marca de tiempo redondeada al DÍA (secreto del voto: no permite casar horas)."""
+    return float(int(float(t) // 86400) * 86400)
+
+
 def issue_credential(eid, user, blinded: str, via: str = "open") -> dict:
-    """IDENTIDAD: firma a ciegas en la VÍA elegida. Nunca ve el token; solo marca 'emitida'."""
+    """IDENTIDAD: firma a ciegas en la VÍA elegida. Nunca ve el token; solo marca 'emitida'.
+    v59: UNA papeleta por persona y votación, sea cual sea la vía; quien tiene la cuenta
+    verificada con certificado vota en la vía 'verified'."""
     _via_ok(via)
     if via == "open" and not user["verified"]:
         raise SferaError(403, "Verifica tu email para poder votar")
     if via == "verified" and user.get("loa") != "verified":
         raise SferaError(403, "Para votar con certificado digital necesitas DNIe o Cl@ve (muy pronto)")
+    if user.get("loa") == "verified" and via != "verified":
+        raise SferaError(403, CERT_VIA_MSG)
     with db.session() as conn:
         e = _election_gate(conn, eid, user)
-        d_enc = e["blind_open_d"] if via == "open" else e["blind_verified_d"]
         n = int(e["blind_open_n"] if via == "open" else e["blind_verified_n"])
+        try:
+            b = int(str(blinded).strip())
+        except Exception:
+            raise SferaError(400, BAD_VOTE_MSG)
+        if not (1 < b < n):
+            raise SferaError(400, BAD_VOTE_MSG)
+        # Comprobar ANTES de insertar (en Postgres un error de integridad anula la transacción).
+        if conn.execute("SELECT 1 FROM credential_issued WHERE election_id=? AND user_id=?",
+                        (eid, user["id"])).fetchone():
+            raise SferaError(409, ALREADY_CRED_MSG)
+        d_enc = e["blind_open_d"] if via == "open" else e["blind_verified_d"]
         d = int(_dec(d_enc))
-        blind_sig = pow(int(blinded), d, n)
+        blind_sig = pow(b, d, n)
         try:
             conn.execute("INSERT INTO credential_issued(election_id,user_id,via,issued_at) VALUES(?,?,?,?)",
-                         (eid, user["id"], via, db.now()))
+                         (eid, user["id"], via, _day(db.now())))
             conn.commit()
-        except db.INTEGRITY_ERRORS:
-            raise SferaError(409, "Ya has votado en esta votación: cada persona vota una sola vez")
+        except db.INTEGRITY_ERRORS:      # carrera (doble clic simultáneo): no se reutiliza la conexión
+            raise SferaError(409, ALREADY_CRED_MSG)
     return {"blind_sig": str(blind_sig), "via": via}
+
+
+def _parse_vote(options, token_hex, sig, ballot, bit_proofs, sum_proof):
+    """Convierte la entrada del voto a enteros. Cualquier dato mal formado → 400 (nunca 500)."""
+    try:
+        if not isinstance(ballot, list) or not isinstance(bit_proofs, list) or not isinstance(sum_proof, dict):
+            raise ValueError("forma")
+        token_bytes = bytes.fromhex(str(token_hex))
+        if not token_bytes:
+            raise ValueError("token")
+        sig_i = int(str(sig).strip())
+        ballot_t = [(int(b["c1"]), int(b["c2"])) for b in ballot]
+        bp = [_int_bit_proof(p) for p in bit_proofs]
+        sp = _int_sum_proof(sum_proof)
+        if len(ballot_t) != len(options) or len(bp) != len(options):
+            raise ValueError("longitud")
+        if any(not (0 < x < cc.P) for pair in ballot_t for x in pair):
+            raise ValueError("rango")
+        if sig_i <= 0:
+            raise ValueError("firma")
+    except SferaError:
+        raise
+    except Exception:
+        raise SferaError(400, BAD_VOTE_MSG)
+    return token_bytes, sig_i, ballot_t, bp, sp
 
 
 def _int_bit_proof(pr: dict) -> dict:
@@ -2409,19 +2702,24 @@ def cast_vote(eid, token_hex, sig, ballot, bit_proofs=None, sum_proof=None, via:
         if not e or e["status"] != "abierta":
             raise SferaError(409, "La votación de este asunto está cerrada")
         options = json.loads(e["options_json"])
-        if len(ballot) != len(options):
+        if not isinstance(ballot, list) or len(ballot) != len(options):
             raise SferaError(400, "Tu voto no se ha podido leer. Recarga la página e inténtalo de nuevo.")
-        pub = _blind_pub_for(e, via)
-        token_bytes = bytes.fromhex(token_hex)
-        if not cc.BlindSigner.verify(pub, token_bytes, int(sig)):
-            raise SferaError(403, "El permiso para votar no es válido. Recarga la página e inténtalo de nuevo.")
         if bit_proofs is None or sum_proof is None:
             raise SferaError(400, "Tu voto llegó incompleto. Recarga la página e inténtalo de nuevo.")
+        token_bytes, sig_i, ballot_t, bp, sp = _parse_vote(options, token_hex, sig, ballot, bit_proofs, sum_proof)
+        pub = _blind_pub_for(e, via)
+        try:
+            sig_ok = cc.BlindSigner.verify(pub, token_bytes, sig_i)
+        except Exception:
+            raise SferaError(400, BAD_VOTE_MSG)
+        if not sig_ok:
+            raise SferaError(403, "El permiso para votar no es válido. Recarga la página e inténtalo de nuevo.")
         H = int(json.loads(e["elgamal_pub_json"])["h"])
-        ballot_t = [(int(b["c1"]), int(b["c2"])) for b in ballot]
-        bp = [_int_bit_proof(p) for p in bit_proofs]
-        sp = _int_sum_proof(sum_proof)
-        if not zk.verify_ballot(H, ballot_t, bp, sp):
+        try:
+            zk_ok = zk.verify_ballot(H, ballot_t, bp, sp)
+        except Exception:
+            raise SferaError(400, BAD_VOTE_MSG)
+        if not zk_ok:
             raise SferaError(400, "Tu voto no ha superado la comprobación de seguridad. Recarga la página e inténtalo de nuevo.")
         token_hash = hashlib.sha256(token_bytes).hexdigest()
         if conn.execute("SELECT 1 FROM spent_tokens WHERE election_id=? AND token_hash=?", (eid, token_hash)).fetchone():
@@ -2431,8 +2729,10 @@ def cast_vote(eid, token_hex, sig, ballot, bit_proofs=None, sum_proof=None, via:
         payload = json.dumps({"via": via, "ballot": ballot, "bit_proofs": bit_proofs, "sum_proof": sum_proof}, sort_keys=True)
         entry_hash = cc.chain_hash(last["entry_hash"], payload)
         try:
+            # v59: sin hora en las papeletas (created=NULL): el orden lo da seq; la hora no se
+            # puede casar con la de la emisión de la papeleta (credential_issued, al día).
             conn.execute("INSERT INTO bulletin_board(election_id,seq,kind,via,payload_json,prev_hash,entry_hash,created) VALUES(?,?,?,?,?,?,?,?)",
-                         (eid, seq, "ballot", via, payload, last["entry_hash"], entry_hash, db.now()))
+                         (eid, seq, "ballot", via, payload, last["entry_hash"], entry_hash, None))
             conn.execute("INSERT INTO spent_tokens(election_id,token_hash,via) VALUES(?,?,?)", (eid, token_hash, via))
             conn.commit()
         except db.INTEGRITY_ERRORS:
@@ -2448,24 +2748,37 @@ def receipt_code(entry_hash: str) -> str:
     return h[:4] + "-" + h[4:8] if len(h) == 8 else h
 
 
-def check_receipt(eid: int, code: str) -> dict:
+_LONG_RECEIPT_RX = re.compile(r"^\s*REC-(\d{4})-E(\d+)-([A-Z]{3})-(\d+)\s*$", re.IGNORECASE)
+
+
+def check_receipt(eid: int, code: str, user=None) -> dict:
     """PÚBLICO: ¿sigue en la urna el voto con este comprobante? Acepta el comprobante corto
-    (AB12-CD34, con o sin guion) o la huella completa. Devuelve su posición entre los votos."""
-    c = re.sub(r"[^0-9a-fA-F]", "", code or "").lower()
-    if len(c) < 8:
+    (AB12-CD34, con o sin guion), la huella completa o (v59) el recibo largo que devuelve
+    cast_vote («REC-2026-E1-OPE-0001»). Devuelve su posición entre los votos."""
+    m = _LONG_RECEIPT_RX.match(code or "")
+    c = "" if m else re.sub(r"[^0-9a-fA-F]", "", code or "").lower()
+    if not m and len(c) < 8:
         raise SferaError(400, "Escribe el comprobante completo (8 letras y números, por ejemplo AB12-CD34)")
     with db.session() as conn:
+        _visible_election(conn, eid, user)
         e = conn.execute("SELECT id, status FROM elections WHERE id=?", (eid,)).fetchone()
-        if not e:
-            raise SferaError(404, "Esta votación no existe")
-        rows = conn.execute("SELECT seq, entry_hash FROM bulletin_board WHERE election_id=? AND kind='ballot' ORDER BY seq",
+        rows = conn.execute("SELECT seq, via, entry_hash FROM bulletin_board WHERE election_id=? AND kind='ballot' ORDER BY seq",
                             (eid,)).fetchall()
     total = len(rows)
+    status = dict(e)["status"]
+    if m:
+        r_eid, r_via, r_seq = int(m.group(2)), m.group(3).lower(), int(m.group(4))
+        if r_eid == int(eid):
+            for i, r in enumerate(rows):
+                if int(r["seq"]) == r_seq and str(r["via"] or "")[:3].lower() == r_via:
+                    return {"found": True, "position": i + 1, "total": total, "status": status,
+                            "code": receipt_code(r["entry_hash"])}
+        return {"found": False, "position": None, "total": total, "status": status, "code": (code or "").strip().upper()}
     for i, r in enumerate(rows):
         if str(r["entry_hash"]).lower().startswith(c):
-            return {"found": True, "position": i + 1, "total": total, "status": dict(e)["status"],
+            return {"found": True, "position": i + 1, "total": total, "status": status,
                     "code": receipt_code(r["entry_hash"])}
-    return {"found": False, "position": None, "total": total, "status": dict(e)["status"], "code": receipt_code(c)}
+    return {"found": False, "position": None, "total": total, "status": status, "code": receipt_code(c)}
 
 
 def _tally_via(options, ballots_via, shares, n):
@@ -2504,18 +2817,56 @@ def close_election(eid, user) -> dict:
     return result
 
 
-def get_board(eid) -> list:
+def get_board(eid, user=None) -> list:
     with db.session() as conn:
+        _visible_election(conn, eid, user)
         rows = [dict(r) for r in conn.execute("SELECT seq,kind,via,payload_json,prev_hash,entry_hash FROM bulletin_board WHERE election_id=? ORDER BY seq", (eid,)).fetchall()]
     return rows
 
 
-def audit(eid) -> dict:
+# v59: la auditoría pública es costosa (verifica TODAS las pruebas ZK y repite el recuento).
+# Se guarda en memoria por (votación, última entrada del tablón, estado): mientras el tablón no
+# cambie, se responde con el resultado ya calculado.
+_AUDIT_CACHE: dict = {}
+_AUDIT_CACHE_MAX = 256
+_audit_lock = threading.Lock()
+
+
+def _cache_get(key):
+    with _audit_lock:
+        v = _AUDIT_CACHE.get(key)
+        if v is None or time.time() - v[0] > 60:   # v59: como mucho 60 s (re-verifica a menudo)
+            return None
+        return dict(v[1])
+
+
+def _cache_put(key, value):
+    with _audit_lock:
+        if len(_AUDIT_CACHE) >= _AUDIT_CACHE_MAX:
+            for k in list(_AUDIT_CACHE.keys())[: _AUDIT_CACHE_MAX // 4]:
+                _AUDIT_CACHE.pop(k, None)
+        _AUDIT_CACHE[key] = (time.time(), dict(value))
+
+
+def audit(eid, user=None) -> dict:
     with db.session() as conn:
+        _visible_election(conn, eid, user)
         e = conn.execute("SELECT * FROM elections WHERE id=?", (eid,)).fetchone()
+        last = conn.execute("SELECT MAX(seq) AS m FROM bulletin_board WHERE election_id=?", (eid,)).fetchone()
+        key = ("election", int(eid), dict(last)["m"] if last else None, e["status"] if e else None,
+               hashlib.sha256((e["result_json"] or "").encode()).hexdigest() if e else None)
+        cached = _cache_get(key)
+        if cached is not None:
+            return cached
         rows = conn.execute("SELECT * FROM bulletin_board WHERE election_id=? ORDER BY seq", (eid,)).fetchall()
     if not e:
         raise SferaError(404, "Este asunto no existe")
+    out = _audit_compute(e, rows)
+    _cache_put(key, out)
+    return out
+
+
+def _audit_compute(e, rows) -> dict:
     prev = "GENESIS"; chain_ok = True
     for r in rows:
         if r["prev_hash"] != prev or r["entry_hash"] != cc.chain_hash(prev, r["payload_json"]):

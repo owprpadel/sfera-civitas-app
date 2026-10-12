@@ -163,7 +163,6 @@ def add_doc(did: int, user, kind: str, title: str, text: str = "", url: str = ""
         raise SferaError(400, f"El texto no puede superar {TEXT_MAX} caracteres")
     if url and not valid_url(url):
         raise SferaError(400, "El enlace debe empezar por http:// o https:// y ser una dirección web válida")
-    f = uploads.validate(file_name, data_b64) if has_file else None
     if not _skip_checks and not user.get("verified"):
         raise SferaError(403, "Verifica tu email para aportar documentos")
     with db.session() as conn:
@@ -187,9 +186,11 @@ def add_doc(did: int, user, kind: str, title: str, text: str = "", url: str = ""
                 raise SferaError(409, "En esta fase no se pueden añadir documentos")
             if ph == "convocar" and d.get("conv_status") == "caducado":
                 raise SferaError(409, "Este asunto no reunió los apoyos a tiempo: ya no admite documentos nuevos")
-        if f and not _skip_checks and _files_today(conn, user["id"]) >= uploads.MAX_FILES_PER_DAY:
+        if has_file and not _skip_checks and _files_today(conn, user["id"]) >= uploads.MAX_FILES_PER_DAY:
             raise SferaError(429, f"Has subido muchos archivos hoy (máximo {uploads.MAX_FILES_PER_DAY} al día). "
                                   "Inténtalo mañana.")
+        # v59: el archivo se valida DESPUÉS de comprobar cuenta, censo y fase.
+        f = uploads.validate(file_name, data_b64) if has_file else None
         cur = conn.execute("INSERT INTO citizen_docs(debate_id,user_id,kind,title,text,url,phase,created,proposal_id,"
                            "file_name,mime_type,file_size,data_b64,sha256) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                            (did, user["id"], kind, title, text or None, url or None, ph, db.now(), proposal_id,

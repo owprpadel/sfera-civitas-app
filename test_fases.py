@@ -8,6 +8,7 @@ ciudadanas son insumo. Sin propuestas expertas: +7 días una vez y después se d
 ('sin_propuestas_expertas'). Escala: «Útil» y listados paginados/filtrados.
 Ejecuta: python test_fases.py"""
 import os
+os.environ.setdefault("SFERA_CERT_SIM_ALLOWED", "1")  # simulación de certificado solo en tests
 import secrets
 import threading
 
@@ -119,7 +120,8 @@ past(did, 1)
 old_dl = one("SELECT phase_deadline FROM debates WHERE id=?", (did,))["phase_deadline"]
 d = s.get_debate(did)
 check(d["phase"] == "proponer", "al leer, pasa sola a proponer")
-check(abs(d["phase_deadline"] - (old_dl + s.PROP_DIAS * DAY)) < 1, "plazo de proponer encadenado desde el vencimiento")
+# v59: el plazo nuevo cuenta desde max(vencimiento, ahora): la fase dura completa aunque nadie abriera el asunto.
+check(abs(d["phase_deadline"] - (max(old_dl, db.now()) + s.PROP_DIAS * DAY)) < 60, "plazo de proponer: completo desde max(vencimiento, ahora)")
 d2 = s.get_debate(did)
 check(d2["phase"] == "proponer" and d2["phase_deadline"] == d["phase_deadline"], "idempotente (segunda lectura no cambia nada)")
 expect_error(lambda: s.add_argument(did, autor["id"], "favor", "tarde"), 409, "proponer: deliberación cerrada",
@@ -236,7 +238,7 @@ expect_error(lambda: s.close_election(eid, admin), 409, "no se cierra dos veces"
 expect_error(lambda: s.extend_phase(did, 3, "Motivo suficientemente largo", admin), 409, "publicado: sin plazo que ampliar")
 check(d["phase_deadline"] is None and d["phase_dias_restantes"] is None, "publicar: sin plazo")
 
-print("7) Cadena vencida: deliberar → proponer → votar → publicar en una sola lectura")
+print("7) Cadena vencida: cada fase siguiente dura COMPLETA (v59: una votación no se abre y cierra a la vez)")
 did2 = s.create_debate("Horario de verano de las piscinas", "", "Deportes", "Ayuntamiento", autor)["debate_id"]
 s.set_phase(did2, "proponer", admin)
 s.add_proposal(did2, u[0]["id"], "Abrir hasta las 22h")
@@ -244,10 +246,16 @@ ep(did2, admin, "Abrir hasta las 22h en julio y agosto")
 ep(did2, admin, "Abrir también los lunes")
 sql("UPDATE debates SET phase='deliberar', phase_deadline=? WHERE id=?", (db.now() - 60 * DAY, did2))
 d = s.get_debate(did2)
-check(d["phase"] == "publicar", "cadena entera puesta al día")
-check(d["election"] and d["election"]["status"] == "cerrada"
-      and d["election"]["options"] == ["Abrir hasta las 22h en julio y agosto", "Abrir también los lunes", s.NONE_OPTION],
+check(d["phase"] == "proponer" and d["phase_dias_restantes"] in (s.PROP_DIAS, s.PROP_DIAS - 1),
+      "vencido hace 60 días: pasa a proponer con su plazo completo (no salta fases)")
+past(did2, 1); d = s.get_debate(did2)
+check(d["phase"] == "votar" and d["election"] and d["election"]["status"] == "abierta"
+      and d["phase_dias_restantes"] in (s.VOTACION_DIAS, s.VOTACION_DIAS - 1),
+      "la votación se ABRE con su plazo completo (no se cierra en la misma petición)")
+check(d["election"]["options"] == ["Abrir hasta las 22h en julio y agosto", "Abrir también los lunes", s.NONE_OPTION],
       "papeleta con <5 propuestas expertas: todas + «Ninguna»")
+past(did2, 1); d = s.get_debate(did2)
+check(d["phase"] == "publicar" and d["election"]["status"] == "cerrada", "cadena entera puesta al día")
 check(d["election"]["result"]["open"]["total_votos"] == 0, "recuento (vacío) publicado")
 
 print("8) Sin propuestas EXPERTAS: +7 días una vez, aviso y después 'sin_propuestas_expertas'")

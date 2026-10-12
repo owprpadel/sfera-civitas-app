@@ -47,6 +47,11 @@ ALLOWED = {
 }
 ALLOWED_LIST = "PDF, JPG, PNG, Word (.docx), Excel (.xlsx), PowerPoint (.pptx) u OpenDocument (.odt, .ods, .odp)"
 _OOXML_MAIN = {"docx": "word/", "xlsx": "xl/", "pptx": "ppt/"}
+# v59: anti «bomba zip» (Office/OpenDocument son ZIP): límites ANTES de descomprimir nada.
+ZIP_MAX_TOTAL = 200 * 1024 * 1024     # tamaño descomprimido total máximo
+ZIP_MAX_ENTRIES = 2000                # nº máximo de ficheros dentro
+ZIP_MIMETYPE_MAX = 100                # el fichero «mimetype» de OpenDocument es diminuto
+ZIP_BAD_MSG = "El archivo es demasiado complejo o está dañado. Guárdalo de nuevo y vuelve a intentarlo."
 
 
 def ext_of(name: str) -> str:
@@ -77,15 +82,20 @@ def _magic_ok(ext: str, raw: bytes) -> bool:
             return False
         try:
             z = zipfile.ZipFile(io.BytesIO(raw))
-            names = z.namelist()
+            infos = z.infolist()
+            names = [i.filename for i in infos]
         except Exception:
             return False
+        if len(infos) > ZIP_MAX_ENTRIES or sum(max(0, int(i.file_size)) for i in infos) > ZIP_MAX_TOTAL:
+            raise SferaError(413, ZIP_BAD_MSG)
         low = [n.lower() for n in names]
         if any(n.endswith("vbaproject.bin") or n.endswith(".bin") and "vba" in n for n in low):
             return False            # documentos con macros: no
         if ext in _OOXML_MAIN:
             return "[content_types].xml" in low and any(n.startswith(_OOXML_MAIN[ext]) for n in low)
         try:
+            if z.getinfo("mimetype").file_size > ZIP_MIMETYPE_MAX:
+                return False
             mt = z.read("mimetype").decode("ascii", "replace").strip()
         except Exception:
             return False

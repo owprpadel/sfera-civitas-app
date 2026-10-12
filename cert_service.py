@@ -53,6 +53,10 @@ import db
 
 MODE = os.environ.get("SFERA_CERT_MODE", "sim").lower()
 SECRET = (os.environ.get("SFERA_SECRET", "sfera-dev-secret")).encode()
+if not os.environ.get("SFERA_SECRET") and db.BACKEND == "postgres":   # v59: aviso RUIDOSO, sin caer
+    import sys as _sys
+    print("[sfera] PELIGRO (cert_service): SFERA_SECRET sin configurar en producción: el identificador "
+          "pseudónimo del certificado usa un secreto PÚBLICO. Configúralo en Render.", file=_sys.stderr, flush=True)
 TRUSTDIR = os.environ.get("SFERA_CERT_TRUSTDIR",
                           os.path.join(os.path.dirname(__file__), "trust_store"))
 CHALLENGE_TTL = 300  # 5 min de validez del reto
@@ -246,7 +250,7 @@ def _verify_signature(cert, sig: bytes, nonce_bytes: bytes, fmt: str):
                 _p7.verify_pkcs7(sig, nonce_bytes)  # type: ignore
                 return
         except InvalidSignature:
-            raise CertError(401, "Firma PKCS#7 inválida sobre el reto")
+            raise CertError(403, "Firma PKCS#7 inválida sobre el reto")
         except Exception:
             pass
         # Si no podemos verificar el CMS de forma fiable, no aceptamos a ciegas.
@@ -261,7 +265,7 @@ def _verify_signature(cert, sig: bytes, nonce_bytes: bytes, fmt: str):
         else:
             raise CertError(415, "Tipo de clave del certificado no soportado")
     except InvalidSignature:
-        raise CertError(401, "La firma no corresponde al reto emitido")
+        raise CertError(403, "La firma no corresponde al reto emitido")
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +326,7 @@ def _verify_cms_detached(sig_der: bytes, content: bytes):
         signed_attrs = next((x for x in si if x["tag"] == 0xA0), None)
         sig_octet = [x for x in si if x["tag"] == 0x04][-1]
         signature = sig_octet["val"]
+        sid = si[1]                                         # SignerIdentifier (v59: elige el firmante por él)
     except CertError:
         raise
     except Exception:
@@ -342,8 +347,11 @@ def _verify_cms_detached(sig_der: bytes, content: bytes):
                 continue
         if not all_certs:
             raise CertError(400, "No hay certificados en el CMS")
-        # firmante = la hoja (el que no es CA); si no se distingue, el primero
-        signer = next((c for c in all_certs if _is_leaf(c)), all_certs[0])
+        # v59: firmante = el certificado que casa con el SignerIdentifier del SignerInfo
+        # (emisor + número de serie, o identificador de clave). Antes: «la primera hoja».
+        signer = _match_signer(sid, all_certs)
+        if signer is None:
+            raise CertError(400, "No se encuentra en la firma el certificado de quien firma")
     except CertError:
         raise
     except Exception:
@@ -356,7 +364,7 @@ def _verify_cms_detached(sig_der: bytes, content: bytes):
         if ac and ac[0]["val"] == _OID_MSGDIGEST:
             md_found = _der_children(ac[1]["val"])[0]["val"]
     if md_found != md_expected:
-        raise CertError(401, "El resumen firmado no corresponde al reto (messageDigest)")
+        raise CertError(403, "El resumen firmado no corresponde al reto (messageDigest)")
     # firma de los signedAttrs (re-etiquetados como SET 0x31)
     sa = b"\x31" + signed_attrs["full"][1:]
     pub = signer.public_key()
@@ -368,8 +376,39 @@ def _verify_cms_detached(sig_der: bytes, content: bytes):
         else:
             raise CertError(415, "Tipo de clave del certificado no soportado")
     except InvalidSignature:
-        raise CertError(401, "La firma CAdES no corresponde al reto emitido")
+        raise CertError(403, "La firma CAdES no corresponde al reto emitido")
     return signer, all_certs
+
+
+def _match_signer(sid, certs):
+    """Certificado del CMS que corresponde al SignerIdentifier (RFC 5652 §5.3)."""
+    try:
+        if sid["tag"] == 0x30:                      # IssuerAndSerialNumber
+            parts = _der_children(sid["val"])
+            issuer_der = parts[0]["full"]
+            serial = int.from_bytes(parts[1]["val"], "big", signed=True)
+            for c in certs:
+                if c.serial_number == serial and c.issuer.public_bytes() == issuer_der:
+                    return c
+            return None
+        if sid["tag"] == 0x80:                      # [0] SubjectKeyIdentifier
+            ski = sid["val"]
+            for c in certs:
+                try:
+                    v = c.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value.digest
+                except Exception:
+                    continue
+                if v == ski:
+                    return c
+            return None
+    except Exception:
+        return None
+    return None
+
+
+# Raíces que NO deben usarse para identificar personas (p. ej. la raíz de servidores TLS
+# de la FNMT): si su fichero está en el directorio de confianza, se ignora (v59).
+_EXCLUDED_ROOT_FILES = ("servidoresseguros",)
 
 
 def _load_trust_roots():
@@ -380,6 +419,8 @@ def _load_trust_roots():
         return roots
     for fn in os.listdir(TRUSTDIR):
         if not fn.lower().endswith((".pem", ".crt", ".cer", ".der")):
+            continue
+        if any(x in fn.lower().replace("_", "").replace("-", "") for x in _EXCLUDED_ROOT_FILES):
             continue
         try:
             with open(os.path.join(TRUSTDIR, fn), "rb") as fh:
@@ -446,6 +487,7 @@ def _validate_certificate(cert, extra_certs=()):
         return  # piloto sin trust store: solo vigencia + firma del nonce ya verificada
     root_subjects = {r.subject: r for r in roots}
     inter_subjects = {c.subject: c for c in extra_certs}
+    _check_leaf_usage(cert)                       # v59: hoja = persona (no CA) que puede firmar
     cur = cert
     for _ in range(10):  # límite de profundidad
         # ¿el emisor actual es una raíz de confianza?
@@ -459,12 +501,56 @@ def _validate_certificate(cert, extra_certs=()):
         nxt = inter_subjects.get(cur.issuer)
         if not nxt or nxt is cur:
             break
+        _check_ca_cert(nxt, now)                  # v59: el intermedio debe ser de verdad una CA
         try:
             _verify_cert_signed_by(cur, nxt)
         except Exception:
             raise CertError(403, "Cadena inválida en un eslabón intermedio")
         cur = nxt
     raise CertError(403, "El certificado no encadena con ninguna CA de confianza (FNMT/DNIe/eIDAS)")
+
+
+def _check_ca_cert(ca, now=None):
+    """Un eslabón intermedio debe ser CA (BasicConstraints ca=True), poder firmar
+    certificados (KeyUsage keyCertSign) y estar vigente."""
+    try:
+        bc = ca.extensions.get_extension_for_class(x509.BasicConstraints).value
+    except Exception:
+        bc = None
+    if not bc or not bc.ca:
+        raise CertError(403, "Cadena inválida: un certificado intermedio no es una autoridad de certificación")
+    try:
+        ku = ca.extensions.get_extension_for_class(x509.KeyUsage).value
+    except Exception:
+        ku = None
+    if not ku or not ku.key_cert_sign:
+        raise CertError(403, "Cadena inválida: un certificado intermedio no puede emitir certificados")
+    if now is not None:
+        import datetime
+        naf = getattr(ca, "not_valid_after_utc", None) or ca.not_valid_after.replace(tzinfo=datetime.timezone.utc)
+        nbf = getattr(ca, "not_valid_before_utc", None) or ca.not_valid_before.replace(tzinfo=datetime.timezone.utc)
+        if now > naf or now < nbf:
+            raise CertError(403, "Cadena inválida: un certificado intermedio está caducado")
+
+
+def _check_leaf_usage(cert):
+    """El certificado de la persona NO puede ser una CA y debe servir para firmar
+    (KeyUsage digitalSignature; se admite también nonRepudiation, que es el uso del
+    certificado de FIRMA del DNIe)."""
+    try:
+        bc = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
+        if bc.ca:
+            raise CertError(403, "Ese certificado es de una autoridad de certificación, no de una persona")
+    except CertError:
+        raise
+    except Exception:
+        pass
+    try:
+        ku = cert.extensions.get_extension_for_class(x509.KeyUsage).value
+    except Exception:
+        ku = None
+    if ku is not None and not (ku.digital_signature or ku.content_commitment):
+        raise CertError(403, "Ese certificado no sirve para firmar")
 
 
 def _verify_cert_signed_by(cert, ca):

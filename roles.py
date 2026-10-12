@@ -43,9 +43,38 @@ def _matches(scope_type, scope_value, debate_row) -> bool:
     return False
 
 
+def _col(row, k):
+    try:
+        return row[k] if (row is not None and k in row.keys()) else None
+    except Exception:
+        return None
+
+
+def _private_org(debate_row):
+    """org_id si el asunto es de un ESPACIO PRIVADO (organización); None si es público."""
+    return _col(debate_row, "org_id")
+
+
+def is_org_owner(conn, user, org_id) -> bool:
+    if not user or not org_id:
+        return False
+    r = conn.execute("SELECT 1 FROM org_members WHERE org_id=? AND user_id=? AND role='owner'",
+                     (org_id, user["id"])).fetchone()
+    if r:
+        return True
+    return bool(conn.execute("SELECT 1 FROM organizations WHERE id=? AND owner_id=?", (org_id, user["id"])).fetchone())
+
+
 def can_admin(conn, user, debate_row) -> bool:
+    """v59: en un asunto PRIVADO administran el Super Admin y el ORGANIZADOR (owner) de su
+    organización; los permisos por ámbito (AAPP/materia/global) NO se aplican a lo privado."""
+    if not user:
+        return False
     if is_super(user):
         return True
+    oid = _private_org(debate_row)
+    if oid:
+        return is_org_owner(conn, user, oid)
     for g in _grants(conn, user["id"]):
         if g["role"] == "admin" and _matches(g["scope_type"], g["scope_value"], debate_row):
             return True
@@ -53,11 +82,16 @@ def can_admin(conn, user, debate_row) -> bool:
 
 
 def can_author(conn, user, debate_row) -> bool:
+    """Experto del asunto (o su administración). En lo PRIVADO solo cuentan los expertos
+    ASIGNADOS a ese asunto (no los permisos de experto por ámbito)."""
+    if not user:
+        return False
     if can_admin(conn, user, debate_row):
         return True
-    for g in _grants(conn, user["id"]):
-        if g["role"] == "expert" and _matches(g["scope_type"], g["scope_value"], debate_row):
-            return True
+    if not _private_org(debate_row):
+        for g in _grants(conn, user["id"]):
+            if g["role"] == "expert" and _matches(g["scope_type"], g["scope_value"], debate_row):
+                return True
     if debate_row and conn.execute("SELECT 1 FROM debate_experts WHERE debate_id=? AND user_id=?",
                                    (debate_row["id"], user["id"])).fetchone():
         return True
@@ -124,10 +158,9 @@ def list_grants(requester: dict) -> list:
 
 
 def my_role(user: dict, did: int) -> dict:
+    import service as _s
     with db.session() as conn:
-        d = conn.execute("SELECT * FROM debates WHERE id=?", (did,)).fetchone()
-        if not d:
-            raise SferaError(404, "Este asunto no existe")
+        d = _s._visible_debate(conn, did, user)     # v59: no revela asuntos privados ajenos
         return {"is_super": is_super(user),
                 "can_admin": can_admin(conn, user, d),
                 "can_author": can_author(conn, user, d)}

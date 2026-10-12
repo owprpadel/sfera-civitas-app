@@ -158,13 +158,23 @@ def unassign_profile(user, did, pid) -> dict:
         if not roles.can_admin(conn, user, d):
             raise SferaError(403, "Solo la administración del asunto puede retirar expertos")
         conn.execute("DELETE FROM debate_expert_profiles WHERE debate_id=? AND profile_id=?", (did, pid))
+        # v59: si el perfil tiene cuenta vinculada, esa cuenta deja también de ser experta del
+        # asunto (pierde el permiso de publicar en él), salvo que otro perfil suyo siga asignado.
+        p = conn.execute("SELECT user_id FROM expert_profiles WHERE id=?", (pid,)).fetchone()
+        uid = dict(p).get("user_id") if p else None
+        if uid and not conn.execute(
+                "SELECT 1 FROM debate_expert_profiles dp JOIN expert_profiles p ON p.id=dp.profile_id "
+                "WHERE dp.debate_id=? AND p.user_id=?", (did, uid)).fetchone():
+            conn.execute("DELETE FROM debate_experts WHERE debate_id=? AND user_id=?", (did, uid))
         conn.commit()
     return {"ok": True}
 
 
-def list_debate_profiles(did: int) -> list:
-    """PÚBLICO: expertos (perfiles) asignados a un asunto, sin emails."""
+def list_debate_profiles(did: int, user=None) -> list:
+    """PÚBLICO: expertos (perfiles) asignados a un asunto, sin emails (privado: solo su censo)."""
+    import service as _s
     with db.session() as conn:
+        _s._visible_debate(conn, did, user)
         rows = [dict(r) for r in conn.execute(
             "SELECT p.* FROM debate_expert_profiles dp JOIN expert_profiles p ON p.id=dp.profile_id "
             "WHERE dp.debate_id=? ORDER BY dp.assigned_at, p.id", (did,)).fetchall()]

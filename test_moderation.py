@@ -3,6 +3,7 @@
 resolución por moderador (keep/hide/remove) y bloqueo de usuarios.
 Ejecuta: python test_moderation.py"""
 import os
+os.environ.setdefault("SFERA_CERT_SIM_ALLOWED", "1")  # simulación de certificado solo en tests
 os.environ["SFERA_DB"] = "/tmp/sfera_test_mod.db"
 os.environ.setdefault("SFERA_ADMIN_EMAILS", "modadmin@sfera.org")
 os.environ["SFERA_REPORT_THRESHOLD"] = "3"

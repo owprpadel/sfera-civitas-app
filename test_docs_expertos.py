@@ -8,6 +8,7 @@
 Ejecuta: python3 test_docs_expertos.py"""
 import json
 import os
+os.environ.setdefault("SFERA_CERT_SIM_ALLOWED", "1")  # simulación de certificado solo en tests
 
 os.environ["SFERA_DB"] = "/tmp/sfera_test_docs_expertos.db"
 os.environ.setdefault("SFERA_ADMIN_EMAILS", "dadmin@sfera.org")

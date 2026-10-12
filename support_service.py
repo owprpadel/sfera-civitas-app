@@ -195,15 +195,18 @@ def _handle_message(ext_id: str, sender: str, subject: str, body: str, summary: 
         with db.session() as conn:
             conn.execute("UPDATE support_tickets SET status='acuse', updated=? WHERE id=?", (db.now(), tid)); conn.commit()
     faq = _match_faq(subject, body)
+    resolved = False
     if faq and sender:
         title, text = faq
         if service._send_email(sender, f"Re: {subject or title} · Sfera Civitas", text + _SIGN):
+            resolved = True
             summary["resueltos"] = summary.get("resueltos", 0) + 1
             summary.setdefault("detalle", []).append({"ticket": tid, "de": sender, "asunto": subject, "accion": "resuelto", "faq": title})
             with db.session() as conn:
                 conn.execute("UPDATE support_tickets SET status='resuelto', resolution=?, updated=? WHERE id=?",
                              (title, db.now(), tid)); conn.commit()
-    else:
+    # v59: si no hay FAQ, o la había pero NO se pudo enviar la respuesta, se escala (no se pierde).
+    if not resolved:
         esc = (f"Nuevo mensaje de soporte que requiere respuesta humana.\n\n"
                f"De: {sender}\nAsunto: {subject}\n\n{body}\n\n"
                f"(Ticket #{tid}. Responde directamente al remitente.)")

@@ -82,8 +82,9 @@ def assign_expert(did: int, email_or_id, actor: dict) -> dict:
 def list_experts(did: int, user=None) -> list:
     """Cuentas de experto asignadas a un asunto. PRIVACIDAD: el email solo lo ve la
     administración del asunto; en público se devuelve el nombre del perfil (si lo hay)."""
+    import service as _s
     with db.session() as conn:
-        d = conn.execute("SELECT * FROM debates WHERE id=?", (did,)).fetchone()
+        d = _s._visible_debate(conn, did, user)          # v59: privado → solo su censo
         adm = bool(user) and bool(d) and roles.can_admin(conn, user, d)
         rows = [dict(r) for r in conn.execute(
             "SELECT u.id AS id, u.email AS email, (SELECT p.display_name FROM expert_profiles p WHERE p.user_id=u.id "
@@ -178,15 +179,15 @@ def create_document(did, user, doc_type, title, content_kind, content_text=None,
         raise SferaError(400, "Ponle un título al documento")
     if len(title) > 200:
         raise SferaError(400, "El título no puede superar 200 caracteres")
-    ck, ctext, fname, mime, b64 = _validate_content(content_kind, content_text, data_b64, file_name)
     with db.session() as conn:
-        d = conn.execute("SELECT * FROM debates WHERE id=?", (did,)).fetchone()
-        if not d:
-            raise SferaError(404, "Este asunto no existe")
-        if not roles.can_author(conn, user, d):
-            raise SferaError(403, "Solo los expertos de este asunto (o su administración) pueden publicar documentos de expertos")
         import service as _s
-        d = _s._refresh(conn, d)              # al día (puede cambiar de fase) ANTES de bloquear
+        drow = _s._row(conn, did)
+        if not drow:
+            raise SferaError(404, "Este asunto no existe")
+        if not roles.can_author(conn, user, drow):
+            raise SferaError(403, "Solo los expertos de este asunto (o su administración) pueden publicar documentos de expertos")
+        # v59: visibilidad + oculto por moderación + al día (puede cambiar de fase) ANTES de bloquear
+        d = _s._load_debate(conn, did, user=user, staff_ok=True)
         db.lock_row(conn, "debates", did)     # serializa el anclaje en el registro del asunto
         ep = None
         if expert_proposal_id not in (None, "", 0):
@@ -204,6 +205,8 @@ def create_document(did, user, doc_type, title, content_kind, content_text=None,
         if ep and author_profile_id in (None, "", 0) and ep.get("author_profile_id") and roles.can_admin(conn, user, d):
             author_profile_id = ep["author_profile_id"]       # mismo autor que la propuesta
         prof_id = _s._resolve_author_profile(conn, did, user, d, author_profile_id)   # atribución (created_by = auditoría)
+        # v59: el contenido (y el archivo) se valida DESPUÉS de permisos y fase.
+        ck, ctext, fname, mime, b64 = _validate_content(content_kind, content_text, data_b64, file_name)
         out = _insert_document(conn, did, user, doc_type, title, ck, ctext, fname, mime, b64, status, prof_id,
                                ep["id"] if ep else None, formal)
         conn.commit()
@@ -212,10 +215,10 @@ def create_document(did, user, doc_type, title, content_kind, content_text=None,
 
 def add_version(document_id, user, content_kind, content_text=None,
                 file_name=None, mime_type=None, data_b64=None) -> dict:
-    ck, ctext, fname, mime, b64 = _validate_content(content_kind, content_text, data_b64, file_name)
+    import moderation
     with db.session() as conn:
         doc = conn.execute("SELECT * FROM documents WHERE id=?", (document_id,)).fetchone()
-        if not doc:
+        if not doc or int(document_id) in moderation.hidden_ids(conn, "document"):
             raise SferaError(404, "Este documento no existe")
         doc = dict(doc)
         did = doc["debate_id"]
@@ -223,9 +226,11 @@ def add_version(document_id, user, content_kind, content_text=None,
         if not roles.can_author(conn, user, d):
             raise SferaError(403, "Solo los expertos de este asunto (o su administración) pueden publicar nuevas versiones")
         import service as _s
-        d = _s._refresh(conn, d)
+        d = _s._load_debate(conn, did, user=user, staff_ok=True)
         db.lock_row(conn, "debates", did)
         _phase_gate(d, proposal_level=bool(doc.get("expert_proposal_id")))
+        # v59: el contenido (y el archivo) se valida DESPUÉS de permisos y fase.
+        ck, ctext, fname, mime, b64 = _validate_content(content_kind, content_text, data_b64, file_name)
         last = conn.execute("SELECT MAX(version_no) AS m FROM document_versions WHERE document_id=?",
                             (document_id,)).fetchone()
         vno = (last["m"] or 0) + 1
@@ -293,17 +298,22 @@ def list_documents(did: int, user=None) -> list:
     """PÚBLICO: documentos de expertos del asunto (los del asunto y los de cada propuesta
     experta, con `expert_proposal_id`) + su última versión (sin binarios) + autoría pública.
     Lo oculto por moderación no se lista."""
+    import service as _s
     with db.session() as conn:
+        _s._visible_debate(conn, did, user)               # v59: privado → solo su censo
         return _public_docs(conn, _visible_docs(conn, "debate_id=?", (did,), user))
 
 
 def list_expert_proposal_docs(epid: int, user=None) -> dict:
     """PÚBLICO: biblioteca de UNA propuesta de expertos: documento formal + otros documentos."""
     import service as _s
+    import moderation
     with db.session() as conn:
         ep = conn.execute("SELECT * FROM expert_proposals WHERE id=?", (epid,)).fetchone()
         if not ep or int(dict(ep).get("hidden") or 0):
             raise SferaError(404, "Esta propuesta de expertos no existe")
+        if int(epid) in moderation.hidden_ids(conn, "expert_proposal") and not moderation.can_moderate(conn, user):
+            raise SferaError(404, "Esta propuesta de expertos no existe")      # v59: oculta por moderación
         ep = dict(ep)
         d = _s._visible_debate(conn, ep["debate_id"], user)
         d = _s._safe_refresh(conn, d)
@@ -323,6 +333,8 @@ def get_document(document_id: int, user=None) -> dict:
         d = conn.execute("SELECT * FROM documents WHERE id=?", (document_id,)).fetchone()
         if not d or int(document_id) in moderation.hidden_ids(conn, "document"):
             raise SferaError(404, "Este documento no existe o se ha retirado")
+        import service as _s0
+        _s0._visible_debate(conn, dict(d)["debate_id"], user)      # v59: privado → solo su censo
         vers = conn.execute("""SELECT version_no,content_kind,file_name,mime_type,sha256,created_by,created,
                                       LENGTH(data_b64) AS b64len
                                FROM document_versions WHERE document_id=? ORDER BY version_no""",
@@ -351,10 +363,16 @@ def get_document(document_id: int, user=None) -> dict:
     return out
 
 
-def get_version_content(document_id: int, version_no: int) -> dict:
-    """PÚBLICO: contenido de una versión (texto, o archivo en base64; compatibilidad)."""
+def get_version_content(document_id: int, version_no: int, user=None) -> dict:
+    """PÚBLICO: contenido de una versión (texto, o archivo en base64; compatibilidad).
+    v59: si el asunto es privado, solo para su censo."""
     import moderation
+    import service as _s
     with db.session() as conn:
+        drow = conn.execute("SELECT debate_id FROM documents WHERE id=?", (int(document_id),)).fetchone()
+        if not drow:
+            raise SferaError(404, "Esta versión no existe")
+        _s._visible_debate(conn, dict(drow)["debate_id"], user)
         v = conn.execute("SELECT * FROM document_versions WHERE document_id=? AND version_no=?",
                          (document_id, version_no)).fetchone()
         hid = int(document_id) in moderation.hidden_ids(conn, "document")
@@ -368,12 +386,18 @@ def get_version_content(document_id: int, version_no: int) -> dict:
             "file_url": _file_url(document_id, v["version_no"]) if v["content_kind"] == "file" else None}
 
 
-def file_content(document_id: int, version_no=None):
-    """Bytes + nombre + tipo de un archivo de experto (para descargar). 404 si es texto u oculto."""
+def file_content(document_id: int, version_no=None, user=None):
+    """Bytes + nombre + tipo de un archivo de experto (para descargar). 404 si es texto u oculto.
+    v59: si el asunto es privado, solo para su censo (antes se podía bajar sabiendo el número)."""
     import moderation
+    import service as s
     with db.session() as conn:
         if int(document_id) in moderation.hidden_ids(conn, "document"):
             raise SferaError(404, "Este documento no existe o se ha retirado")
+        drow = conn.execute("SELECT debate_id FROM documents WHERE id=?", (int(document_id),)).fetchone()
+        if not drow:
+            raise SferaError(404, "Este documento no existe o se ha retirado")
+        s._visible_debate(conn, dict(drow)["debate_id"], user)
         if version_no:
             v = conn.execute("SELECT * FROM document_versions WHERE document_id=? AND version_no=?",
                              (document_id, int(version_no))).fetchone()
@@ -405,12 +429,14 @@ def add_contribution(document_id, user, kind, text, url=None) -> dict:
             raise SferaError(400, "El enlace debe empezar por http:// o https:// y ser una dirección web válida")
     if kind == "enmienda" and user.get("loa") != "verified":
         raise SferaError(403, "Para proponer cambios formales a un documento hace falta certificado digital (muy pronto)")
+    import moderation
     with db.session() as conn:
         doc = conn.execute("SELECT * FROM documents WHERE id=?", (document_id,)).fetchone()
-        if not doc:
+        if not doc or int(document_id) in moderation.hidden_ids(conn, "document"):
             raise SferaError(404, "Este documento no existe")
         import service as _s
-        d = _s._refresh(conn, _s._row(conn, dict(doc)["debate_id"]))
+        # v59: censo del espacio privado + asunto no oculto por moderación (y al día).
+        d = _s._load_debate(conn, dict(doc)["debate_id"], user=user)
         if d.get("phase") not in EXPERT_PHASES:
             raise SferaError(409, "Solo se puede comentar un documento mientras el asunto está en Deliberar o Proponer.")
         conn.execute("INSERT INTO document_contributions(document_id,user_id,kind,text,url,created) VALUES(?,?,?,?,?,?)",
@@ -419,17 +445,26 @@ def add_contribution(document_id, user, kind, text, url=None) -> dict:
     return {"ok": True}
 
 
-def get_ledger(did: int) -> list:
+def get_ledger(did: int, user=None) -> list:
+    import service as _s
     with db.session() as conn:
+        _s._visible_debate(conn, did, user)               # v59: privado → solo su censo
         rows = conn.execute("""SELECT seq,document_id,version,sha256,payload_json,prev_hash,entry_hash,created
                                FROM document_ledger WHERE debate_id=? ORDER BY seq""", (did,)).fetchall()
     return [dict(r) for r in rows]
 
 
-def audit_ledger(did: int) -> dict:
+def audit_ledger(did: int, user=None) -> dict:
     """PÚBLICO: comprueba (1) la cadena de hashes del ledger y (2) que el contenido
     almacenado de cada versión sigue coincidiendo con el sha256 anclado."""
+    import service as _s
     with db.session() as conn:
+        _s._visible_debate(conn, did, user)               # v59: privado → solo su censo
+        last = conn.execute("SELECT MAX(seq) AS m, COUNT(*) AS n FROM document_ledger WHERE debate_id=?", (did,)).fetchone()
+        key = ("ledger", int(did), dict(last)["m"] if last else None, dict(last)["n"] if last else 0)
+        cached = _s._cache_get(key)                        # v59: costoso → en memoria mientras no cambie
+        if cached is not None:
+            return cached
         rows = conn.execute("SELECT * FROM document_ledger WHERE debate_id=? ORDER BY seq", (did,)).fetchall()
         prev = "GENESIS"; chain_ok = True
         for r in rows:
@@ -446,4 +481,6 @@ def audit_ledger(did: int) -> dict:
             sha = _content_sha(v["content_kind"], v["content_text"], v["data_b64"])
             if sha != r["sha256"]:
                 content_ok = False
-    return {"cadena_integra": chain_ok, "contenido_coincide": content_ok, "num_entradas": len(rows)}
+    out = {"cadena_integra": chain_ok, "contenido_coincide": content_ok, "num_entradas": len(rows)}
+    _s._cache_put(key, out)
+    return out

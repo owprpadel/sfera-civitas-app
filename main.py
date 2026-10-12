@@ -74,7 +74,14 @@ _PATTERN_LIMITS = [
     # Argumentos y propuestas ciudadanas (anti-spam; holgado para uso normal)
     (re.compile(r"^/api/debates/\d+/(arguments|proposals)$"), "ugc",
      (int(os.environ.get("SFERA_RL_UGC", "60")), 3600)),
+    # v59: invitaciones a organizaciones (cada una envía un email) y su aceptación
+    (re.compile(r"^/api/orgs/\d+/invite$"), "invite",
+     (int(os.environ.get("SFERA_RL_INVITE", "20")), 3600)),
+    (re.compile(r"^/api/orgs/invites/accept$"), "invite_accept",
+     (int(os.environ.get("SFERA_RL_INVITE_ACCEPT", "20")), 3600)),
 ]
+_HITS_MAX_KEYS = int(os.environ.get("SFERA_RL_MAX_KEYS", "50000"))   # tope de memoria del limitador
+MAX_BODY_BYTES = 16 * 1024 * 1024                                     # v59: tope de tamaño de una petición
 
 
 def _limit_for(path: str):
@@ -86,21 +93,106 @@ def _limit_for(path: str):
     return None, None
 
 
-@app.middleware("http")
-async def rate_limit(request: Request, call_next):
-    limit, key = _limit_for(request.url.path)
-    if limit and request.method == "POST":
-        ip = (request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-              or (request.client.host if request.client else "?"))
-        maxn, window = limit
-        now = time.time()
-        dq = _HITS[(ip, key)]
+def _client_ip(request) -> str:
+    """IP real de quien llama (v59): Netlify (proxy) la pone en «x-nf-client-connection-ip»;
+    si no está, la primera de X-Forwarded-For; si tampoco, la de la conexión."""
+    h = request.headers
+    ip = (h.get("x-nf-client-connection-ip") or "").strip()
+    if not ip:
+        ip = (h.get("x-forwarded-for") or "").split(",")[0].strip()
+    if not ip:
+        ip = request.client.host if getattr(request, "client", None) else "?"
+    return ip[:64] or "?"
+
+
+def _prune_hits(now: float) -> None:
+    """Mantiene acotada la memoria del limitador: quita contadores vacíos o caducados."""
+    for k in list(_HITS.keys()):
+        dq = _HITS.get(k)
+        lim = _LIMITS.get(k[1]) or next((l for _rx, kk, l in _PATTERN_LIMITS if kk == k[1]), None)
+        window = lim[1] if lim else 3600
         while dq and dq[0] < now - window:
             dq.popleft()
-        if len(dq) >= maxn:
+        if not dq:
+            _HITS.pop(k, None)
+    if len(_HITS) > _HITS_MAX_KEYS:             # ataque con muchas IPs: se descartan las más antiguas
+        for k in sorted(_HITS.keys(), key=lambda kk: _HITS[kk][-1] if _HITS[kk] else 0)[: len(_HITS) - _HITS_MAX_KEYS]:
+            _HITS.pop(k, None)
+
+
+def _hit(ip: str, key: str, limit, now: float) -> bool:
+    """Registra un envío. True si se permite; False si supera el límite."""
+    maxn, window = limit
+    if len(_HITS) >= _HITS_MAX_KEYS and (ip, key) not in _HITS:
+        _prune_hits(now)
+    dq = _HITS[(ip, key)]
+    while dq and dq[0] < now - window:
+        dq.popleft()
+    if len(dq) >= maxn:
+        return False
+    dq.append(now)
+    return True
+
+
+def _too_big(request) -> bool:
+    try:
+        return int(request.headers.get("content-length") or 0) > MAX_BODY_BYTES
+    except Exception:
+        return False
+
+
+@app.middleware("http")
+async def rate_limit(request: Request, call_next):
+    if _too_big(request):                       # v59: nada de peticiones gigantes (413)
+        return JSONResponse({"detail": "Lo que intentas enviar es demasiado grande (máximo 16 MB)."}, status_code=413)
+    limit, key = _limit_for(request.url.path)
+    if limit and request.method == "POST":
+        if not _hit(_client_ip(request), key, limit, time.time()):
             return JSONResponse({"detail": "Has hecho demasiados envíos seguidos. Espera un rato y vuelve a intentarlo."}, status_code=429)
-        dq.append(now)
     return await call_next(request)
+
+
+_FILE_URL_RE = re.compile(r"^/api/files/(doc|cdoc)/(\d+)")
+
+
+def sign_file_urls(obj, uid: int):
+    """Añade ?t=… (enlace firmado a ESE archivo) a cada file_url de la respuesta."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == "file_url" and isinstance(v, str):
+                mm = _FILE_URL_RE.match(v)
+                if mm and "t=" not in v:
+                    obj[k] = v + ("&" if "?" in v else "?") + "t=" + s.make_file_token(uid, mm.group(1), int(mm.group(2)))
+            else:
+                sign_file_urls(v, uid)
+    elif isinstance(obj, list):
+        for x in obj:
+            sign_file_urls(x, uid)
+    return obj
+
+
+@app.middleware("http")
+async def sign_file_links(request: Request, call_next):
+    resp = await call_next(request)
+    path = request.url.path
+    if request.method != "GET" or not path.startswith("/api/") or path.startswith("/api/files/"):
+        return resp
+    auth = request.headers.get("authorization") or ""
+    if not auth.startswith("Bearer ") or "application/json" not in (resp.headers.get("content-type") or ""):
+        return resp
+    body = b"".join([chunk async for chunk in resp.body_iterator])
+    headers = {k: v for k, v in resp.headers.items() if k.lower() != "content-length"}
+    uid = None
+    if b"/api/files/" in body:   # solo entonces se mira la sesión (consulta a la BD, fuera del bucle)
+        from starlette.concurrency import run_in_threadpool
+        uid = await run_in_threadpool(s.parse_token, auth[len("Bearer "):].strip())
+    if uid is not None:
+        try:
+            import json as _json
+            body = _json.dumps(sign_file_urls(_json.loads(body), uid), ensure_ascii=False).encode()
+        except Exception:
+            pass
+    return Response(content=body, status_code=resp.status_code, headers=headers)
 
 
 # CORS se añade DESPUÉS del rate-limit para que sea el middleware MÁS EXTERNO:
@@ -168,9 +260,9 @@ class ResetPwIn(BaseModel):
 class CertIn(BaseModel):
     email: str; cert_subject: str
 class CertChallengeIn(BaseModel):
-    email: str
+    email: Optional[str] = None            # v59: se ignora (se usa el email de la sesión)
 class CertVerifyIn(BaseModel):
-    email: str; nonce_id: int; signature: str; cert: str = ""
+    email: Optional[str] = None; nonce_id: int; signature: str; cert: str = ""
     fmt: str = "raw"; signed_nonce: str = ""
 class LoginIn(BaseModel):
     email: str; password: str
@@ -298,11 +390,11 @@ async def support_ingest(request: Request, x_sfera_cron: Optional[str] = Header(
         body = {}
     msgs = body.get("messages") if isinstance(body, dict) else body
     return sup.ingest_messages(msgs or [])
-@app.post("/api/cert/challenge")
-def cert_challenge(i: CertChallengeIn): return _wrap_cert(cs.start_challenge, i.email)
+@app.post("/api/cert/challenge")                         # v59: exige sesión; usa SU email (no el del cuerpo)
+def cert_challenge(i: CertChallengeIn, u=Depends(current_user)): return _wrap_cert(cs.start_challenge, u["email"])
 @app.post("/api/cert/verify")
-def cert_verify(i: CertVerifyIn):
-    return _wrap_cert(cs.verify, i.email, i.nonce_id, i.signature, i.cert, i.fmt, i.signed_nonce)
+def cert_verify(i: CertVerifyIn, u=Depends(current_user)):
+    return _wrap_cert(cs.verify, u["email"], i.nonce_id, i.signature, i.cert, i.fmt, i.signed_nonce)
 @app.post("/api/login")
 def login(i: LoginIn): return _wrap(s.login, i.email, i.password)
 @app.post("/api/change-password")
@@ -400,7 +492,7 @@ def withdraw_expert_proposal(epid: int, u=Depends(current_user)): return _wrap(s
 def open_election(did: int, i: ElectionIn, u=Depends(current_user)):
     return _wrap(s.open_election, did, i.question, i.options, u)
 @app.get("/api/elections/{eid}")
-def election_public(eid: int): return _wrap(s.election_public, eid)
+def election_public(eid: int, u=Depends(optional_user)): return _wrap(s.election_public, eid, u)
 @app.post("/api/elections/{eid}/credential")
 def issue_credential(eid: int, i: CredIn, u=Depends(current_user)):
     return _wrap(s.issue_credential, eid, u, i.blinded, i.via)
@@ -410,11 +502,11 @@ def cast_vote(eid: int, i: CastIn):
 @app.post("/api/elections/{eid}/close")
 def close_election(eid: int, u=Depends(current_user)): return _wrap(s.close_election, eid, u)
 @app.get("/api/elections/{eid}/board")
-def get_board(eid: int): return s.get_board(eid)
+def get_board(eid: int, u=Depends(optional_user)): return _wrap(s.get_board, eid, u)
 @app.get("/api/elections/{eid}/audit")
-def audit(eid: int): return _wrap(s.audit, eid)
-@app.get("/api/elections/{eid}/receipt/{code}")          # PÚBLICO: ¿sigue mi voto en la urna? (comprobante AB12-CD34)
-def check_receipt(eid: int, code: str): return _wrap(s.check_receipt, eid, code)
+def audit(eid: int, u=Depends(optional_user)): return _wrap(s.audit, eid, u)
+@app.get("/api/elections/{eid}/receipt/{code}")          # PÚBLICO: ¿sigue mi voto en la urna? (AB12-CD34 o REC-…)
+def check_receipt(eid: int, code: str, u=Depends(optional_user)): return _wrap(s.check_receipt, eid, code, u)
 
 
 # ── repositorio documental (biblioteca por asunto) ────────────────────────────
@@ -422,10 +514,10 @@ def check_receipt(eid: int, code: str): return _wrap(s.check_receipt, eid, code)
 def assign_expert(did: int, i: ExpertIn, u=Depends(current_user)):
     return _wrap(ds.assign_expert, did, (i.email if i.email else i.user_id), u)
 @app.get("/api/debates/{did}/experts")                    # emails solo para la administración del asunto
-def list_experts(did: int, u=Depends(optional_user)): return ds.list_experts(did, u)
+def list_experts(did: int, u=Depends(optional_user)): return _wrap(ds.list_experts, did, u)
 # ── Perfiles de experto con nombre (sin emails en público) ──
 @app.get("/api/debates/{did}/expert-profiles")           # PÚBLICO: expertos asignados (nombre + especialidad)
-def list_debate_profiles(did: int): return xs.list_debate_profiles(did)
+def list_debate_profiles(did: int, u=Depends(optional_user)): return _wrap(xs.list_debate_profiles, did, u)
 @app.post("/api/debates/{did}/expert-profiles")          # admin del asunto: asignar un perfil existente
 def assign_profile(did: int, i: AssignProfileIn, u=Depends(current_user)):
     return _wrap(xs.assign_profile, u, did, i.profile_id)
@@ -474,14 +566,25 @@ def add_ep_doc(epid: int, i: EPDocIn, u=Depends(current_user)):
         return ds.create_document(r["debate_id"], u, i.doc_type, title, i.content_kind, i.content_text,
                                   i.file_name, i.mime_type, i.data_b64, "publicado", i.author_profile_id, epid, i.formal)
     return _wrap(_go)
+def _file_user(u, t: str, kind: str, fid: int):
+    """Quien abre el archivo: la sesión (cabecera) o, fuera de la app, el enlace firmado ?t=."""
+    if u or not t:
+        return u
+    uid = s.parse_file_token(t, kind, fid)
+    if uid is None:
+        return None
+    try:
+        return s.get_user(uid)
+    except Exception:
+        return None
 def _file_response(raw: bytes, name: str, ctype: str, inline: bool = False) -> Response:
     return Response(content=raw, media_type=ctype, headers=uploads.headers_for(name, inline))
 @app.get("/api/files/doc/{doc_id}")                      # archivo de experto (?v=versión · ?ver=1 para verlo: PDF/imagen)
-def download_doc(doc_id: int, v: Optional[int] = None, ver: int = 0):
-    return _file_response(*_wrap(ds.file_content, doc_id, v), inline=bool(ver))
+def download_doc(doc_id: int, v: Optional[int] = None, ver: int = 0, t: str = "", u=Depends(optional_user)):
+    return _file_response(*_wrap(ds.file_content, doc_id, v, _file_user(u, t, "doc", doc_id)), inline=bool(ver))
 @app.get("/api/files/cdoc/{cid}")                        # archivo de la ciudadanía (?ver=1 para verlo: PDF/imagen)
-def download_cdoc(cid: int, ver: int = 0, u=Depends(optional_user)):
-    return _file_response(*_wrap(cdocs.file_content, cid, u), inline=bool(ver))
+def download_cdoc(cid: int, ver: int = 0, t: str = "", u=Depends(optional_user)):
+    return _file_response(*_wrap(cdocs.file_content, cid, _file_user(u, t, "cdoc", cid)), inline=bool(ver))
 # ── Casos de demostración (Super Admin) ──
 @app.get("/api/admin/demo")
 def demo_status(u=Depends(current_user)): return _wrap(demo_seed.status, u)
@@ -502,7 +605,7 @@ def list_grants(u=Depends(current_user)): return _wrap(rl.list_grants, u)
 def revoke_grant(i: GrantRevokeIn, u=Depends(current_user)): return _wrap(rl.revoke_grant, u, i.grant_id)
 
 @app.get("/api/debates/{did}/documents")                 # LECTURA pública
-def list_documents(did: int, u=Depends(optional_user)): return ds.list_documents(did, u)
+def list_documents(did: int, u=Depends(optional_user)): return _wrap(ds.list_documents, did, u)
 @app.post("/api/debates/{did}/documents")                # crear oficial: experto/admin
 def create_document(did: int, i: DocIn, u=Depends(current_user)):
     return _wrap(ds.create_document, did, u, i.doc_type, i.title, i.content_kind,
@@ -511,7 +614,7 @@ def create_document(did: int, i: DocIn, u=Depends(current_user)):
 @app.get("/api/documents/{doc_id}")                      # LECTURA pública
 def get_document(doc_id: int, u=Depends(optional_user)): return _wrap(ds.get_document, doc_id, u)
 @app.get("/api/documents/{doc_id}/versions/{n}")         # contenido público
-def get_version_content(doc_id: int, n: int): return _wrap(ds.get_version_content, doc_id, n)
+def get_version_content(doc_id: int, n: int, u=Depends(optional_user)): return _wrap(ds.get_version_content, doc_id, n, u)
 @app.post("/api/documents/{doc_id}/versions")            # nueva versión: experto/admin
 def add_version(doc_id: int, i: VersionIn, u=Depends(current_user)):
     return _wrap(ds.add_version, doc_id, u, i.content_kind, i.content_text, i.file_name, i.mime_type, i.data_b64)
@@ -519,9 +622,9 @@ def add_version(doc_id: int, i: VersionIn, u=Depends(current_user)):
 def add_contribution(doc_id: int, i: ContribIn, u=Depends(current_user)):
     return _wrap(ds.add_contribution, doc_id, u, i.kind, i.text, i.url)
 @app.get("/api/debates/{did}/doc-ledger")                # ledger público
-def doc_ledger(did: int): return ds.get_ledger(did)
+def doc_ledger(did: int, u=Depends(optional_user)): return _wrap(ds.get_ledger, did, u)
 @app.get("/api/debates/{did}/doc-audit")                 # auditoría pública del ledger
-def doc_audit(did: int): return ds.audit_ledger(did)
+def doc_audit(did: int, u=Depends(optional_user)): return _wrap(ds.audit_ledger, did, u)
 
 
 # ── moderación de contenido (UGC) y bloqueos · App Store 1.2 ──────────────────

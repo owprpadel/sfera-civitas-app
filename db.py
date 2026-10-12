@@ -610,6 +610,27 @@ def init_db():
     # ── Migraciones oct-2026 (idempotentes, ambos backends) ──
     for table, col, ddl in _NEW_COLUMNS:
         _add_column(conn, table, col, ddl)
+    # v59: nadie es admin sin haber verificado su email (antes se concedía al registrarse).
+    try:
+        conn.execute("UPDATE users SET is_admin=0 WHERE COALESCE(verified,0)=0 AND COALESCE(is_admin,0)=1")
+        conn.commit()
+    except Exception as e:
+        try: conn._raw.rollback()
+        except Exception: pass
+        print(f"[sfera] migración admins sin verificar: {e}")
+    # v59: reset_expires se creó como REAL (float4 en Postgres: pierde precisión en epoch).
+    # Pasa a DOUBLE PRECISION. Idempotente (si ya lo es, no cambia nada). SQLite: no aplica.
+    if BACKEND == "postgres":
+        try:
+            t = conn.execute("SELECT data_type FROM information_schema.columns "
+                             "WHERE table_name='users' AND column_name='reset_expires'").fetchone()
+            if t and str(dict(t).get("data_type", "")).lower() == "real":
+                conn.execute("ALTER TABLE users ALTER COLUMN reset_expires TYPE DOUBLE PRECISION")
+            conn.commit()
+        except Exception as e:   # nunca impide arrancar
+            try: conn._raw.rollback()
+            except Exception: pass
+            print(f"[sfera] migración users.reset_expires: {e}")
     for ddl in ("CREATE INDEX IF NOT EXISTS ix_documents_eprop ON documents(expert_proposal_id)",
                 "CREATE INDEX IF NOT EXISTS ix_citizen_docs_prop ON citizen_docs(proposal_id)"):
         try:
@@ -635,7 +656,9 @@ _NEW_COLUMNS = [
     ("debates", "quorum_override", "INTEGER"),             # quórum rebajado por el admin (opcional)
     ("users", "is_demo", "INTEGER DEFAULT 0"),            # ciudadanía ficticia de los casos de demostración (sin acceso)
     ("users", "reset_code_hash", "TEXT"),                  # recuperar contraseña: huella del código (nunca el código)
-    ("users", "reset_expires", "REAL"),                    # caducidad del código (15 min)
+    ("users", "reset_expires", "{REAL}"),                  # caducidad del código (15 min) · DOUBLE PRECISION en PG
+    ("users", "twofa_attempts", "INTEGER DEFAULT 0"),     # v59: intentos fallidos del código de verificación (máx. 5)
+    ("users", "token_ver", "INTEGER DEFAULT 0"),          # v59: versión de sesión (sube al cambiar contraseña / borrar cuenta)
     ("users", "reset_attempts", "INTEGER DEFAULT 0"),     # intentos fallidos (máx. 5)
     ("documents", "author_profile_id", "INTEGER"),        # perfil de experto al que se atribuye el documento
     ("expert_proposals", "author_profile_id", "INTEGER"), # perfil de experto al que se atribuye la propuesta
