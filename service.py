@@ -196,6 +196,12 @@ def _conv_apply(conn, d, persist=True) -> dict:
                 if cur.rowcount != 0:
                     try: _on_prospera(conn, d, qual)   # avisos in-app + email a admins (asignar expertos)
                     except Exception: pass
+        elif deadline is not None and db.now() > float(deadline) and _get(d, "is_demo"):
+            # v60: los CASOS ILUSTRATIVOS no caducan: se mantienen en su fase (siempre hay ejemplos en cada fase).
+            deadline = db.now() + DEMO_KEEPALIVE_DIAS * 86400
+            if persist:
+                conn.execute("UPDATE debates SET conv_deadline=? WHERE id=? AND phase='convocar'", (deadline, did))
+                conn.commit()
         elif deadline is not None and db.now() > float(deadline):
             conv_status = "caducado"
             if persist:
@@ -375,11 +381,59 @@ def _admin_recipients(conn, d) -> list:
     rows = conn.execute(
         "SELECT u.id AS id, u.email AS email, g.scope_type AS st, g.scope_value AS sv "
         "FROM grants g JOIN users u ON u.id=g.user_id WHERE g.role='admin'").fetchall()
+    import clasificacion as _c
+    terr = _get(d, "territorio") or ""
+    k_adm, k_terr = _c._k(adm), _c._k(terr)
     for r in rows:
         rr = dict(r)
-        if rr["st"] == "global" or (rr["st"] == "aapp" and rr["sv"] == adm) or (rr["st"] == "materia" and rr["sv"] == mat):
+        sv = rr["sv"] or ""; k_sv = _c._k(sv)
+        # v60: coincidencia tolerante (mayúsculas, tildes, espacios) y por territorio
+        # («Ayuntamiento de Madrid» encaja con Ayuntamiento + Madrid); materia normalizada.
+        aapp_ok = rr["st"] == "aapp" and bool(k_sv) and (k_sv == k_adm or k_adm.startswith(k_sv + " ")
+                                                          or (k_terr and k_terr in k_sv and
+                                                              (k_adm.split(" ")[0] in k_sv or k_sv == k_terr)))
+        mat_ok = rr["st"] == "materia" and (k_sv == _c._k(mat) or _c.materia(sv) == mat)
+        if rr["st"] == "global" or aapp_ok or mat_ok:
             out[rr["id"]] = rr["email"]
     return list(out.items())
+
+
+def _expert_suggestions(conn, materia, limit=5) -> list:
+    """v60: perfiles de experto REALES (no de demostración) cuya especialidad encaja con la materia."""
+    try:
+        import clasificacion as _c
+        rows = conn.execute("SELECT id, display_name, specialty FROM expert_profiles WHERE COALESCE(is_demo,0)=0").fetchall()
+        out = []
+        for r in rows:
+            r = dict(r)
+            if _c.materia(r.get("specialty") or "") == materia or _c._k(materia) in _c._k(r.get("specialty") or ""):
+                out.append(f"- {r['display_name']} ({r['specialty']}) · perfil #{r['id']}")
+        return out[:limit]
+    except Exception:
+        return []
+
+
+def _ops_email(subject: str, body: str, already=()) -> None:
+    """v60: copia SIEMPRE a la dirección de gestión (hola@) salvo que ya la haya recibido."""
+    if OPS_EMAIL and OPS_EMAIL.lower() not in {(e or "").lower() for e in already}:
+        _send_email_async(OPS_EMAIL, subject, body)
+
+
+def _ops_nuevo_asunto(conn, d, cl) -> None:
+    """v60: aviso a hola@ de cada asunto PÚBLICO nuevo: clasificación (y lo corregido) + expertos sugeridos."""
+    if _get(d, "org_id") or _get(d, "is_demo"):
+        return
+    import clasificacion as _c
+    sug = _expert_suggestions(conn, d["materia"])
+    body = (f"Nuevo asunto convocado: «{d['title']}»\n{APP_URL}/#asunto-{d['id']}\n\n"
+            f"Materia: {d['materia']}\nAdministración: {d['administracion']}\nNivel: {d['nivel'] or '—'}\n"
+            f"Territorio: {d['territorio'] or '—'}\n")
+    if cl.get("cambios"):
+        body += f"\nClasificación corregida automáticamente: {_c.texto_cambios(cl['cambios'])}\n"
+    body += ("\nEstá en Convocar (reuniendo apoyos). Si llega a Deliberar recibirás el aviso para asignar expertos.\n"
+             + ("\nExpertos que ya encajan con la materia:\n" + "\n".join(sug) + "\n" if sug else
+                "\nTodavía no hay perfiles de experto para esta materia: conviene ir preparándolos.\n"))
+    _ops_email(f"[Sfera Civitas] Nuevo asunto: «{d['title']}»", body)
 
 
 def _on_prospera(conn, d, qual):
@@ -395,10 +449,16 @@ def _on_prospera(conn, d, qual):
     body = (f"El asunto «{title}» ha reunido los apoyos necesarios ({via_txt}) y pasa a la fase Deliberar.\n\n"
             f"Como administrador, entra a asignar los expertos que redactarán los documentos oficiales:\n{link}\n\n"
             f"Materia: {d['materia'] or '—'} · Administración: {d['administracion'] or '—'}\n")
+    sug = _expert_suggestions(conn, d["materia"])
+    body += ("\nExpertos sugeridos (por defecto, según la materia):\n" + "\n".join(sug) + "\n" if sug else
+             "\nNo hay perfiles de experto para esta materia: créalos y asígnalos desde la ficha del asunto.\n")
+    sent = []
     for uid, email in _admin_recipients(conn, d):
         _notify(conn, uid, "experts_needed", did,
                 f"El asunto «{title}» pasa a Deliberar. Asigna expertos.")
-        _send_email(email, subject, body)
+        _send_email(email, subject, body); sent.append(email)
+    if not _get(d, "org_id"):
+        _ops_email(subject, body, already=sent)
     conn.commit()
 
 
@@ -433,6 +493,8 @@ if not os.environ.get("SFERA_SECRET") and db.BACKEND == "postgres":   # v59: avi
           "[sfera] Configura SFERA_SECRET en las variables de entorno del servidor (Render).\n" + "!" * 78 + "\n",
           file=_sys.stderr, flush=True)
 TOKEN_TTL = 7 * 24 * 3600
+OPS_EMAIL = os.environ.get("SFERA_OPS_EMAIL", "hola@sferacivitas.org").strip()   # v60: copia de los avisos de gestión
+DEMO_KEEPALIVE_DIAS = 10          # v60: renovación del plazo de los casos ilustrativos
 ADMIN_EMAILS = {e.strip().lower() for e in os.environ.get("SFERA_ADMIN_EMAILS", "").split(",") if e.strip()}
 # DEV=1 (por defecto) devuelve el código 2FA en la respuesta. En producción (=0) NO,
 # y se envía por email si hay SMTP configurado.
@@ -1315,6 +1377,12 @@ def create_debate(title, body, materia, administracion, user, nivel="", territor
     if len(title) > 160:
         raise SferaError(400, "El título no puede superar 160 caracteres")
     body = (body or "").strip()[:5000]
+    # v60: clasificación automática y corrección (materia, nivel, administración, territorio)
+    import clasificacion
+    _cl = clasificacion.clasificar(title, body, materia, administracion, nivel, territorio, privado=bool(org_id))
+    materia, nivel, territorio = _cl["materia"], _cl["nivel"] or "", _cl["territorio"] or ""
+    if not org_id:
+        administracion = _cl["administracion"]
     plan = (plan or "estandar").strip().lower()
     if plan not in PLANS:
         raise SferaError(400, "Tipo de proceso no válido (estándar o exprés)")
@@ -1363,7 +1431,13 @@ def create_debate(title, body, materia, administracion, user, nivel="", territor
         conn.commit()
         d = conn.execute("SELECT * FROM debates WHERE id=?", (did,)).fetchone()
         conv = _conv_apply(conn, d)
-    return {"debate_id": did, "plan": plan, "plan_dias": dias, "quorum_override": qo, **conv}
+        try:
+            _ops_nuevo_asunto(conn, dict(d), _cl)
+        except Exception:
+            pass
+    return {"debate_id": did, "plan": plan, "plan_dias": dias, "quorum_override": qo,
+            "clasificacion": {"materia": materia, "administracion": administracion, "nivel": nivel, "territorio": territorio,
+                              "corregido": clasificacion.texto_cambios(_cl["cambios"])}, **conv}
 
 
 def set_plan(did: int, plan: str, user, quorum_override=None) -> dict:
@@ -1599,6 +1673,9 @@ def _notify_phase(conn, d, text, admins=False, experts=False, creator=True, emai
             _notify(conn, uid, "fase", d["id"], text)
             if email_subject and email:
                 _send_email_async(email, email_subject, f"{text}\n\n{APP_URL}/#asunto-{d['id']}\n")
+        if admins and email_subject and not _get(d, "org_id"):
+            _ops_email(email_subject, f"{text}\n\n{APP_URL}/#asunto-{d['id']}\n",
+                       already=[e for u, e in targets if u in sent])
     except Exception:
         pass
 
@@ -1699,6 +1776,14 @@ def _phase_apply(conn, did) -> None:
         if not d or not _phase_due(d):
             conn.commit(); continue
         ph, now, dl = d["phase"], db.now(), d.get("phase_deadline")
+        if d.get("is_demo") and ph in ("deliberar", "proponer", "votar"):
+            # v60: un CASO ILUSTRATIVO no avanza solo: al vencer, renueva su plazo y sigue en su fase.
+            new = now + DEMO_KEEPALIVE_DIAS * 86400
+            if ph == "votar":
+                conn.execute("UPDATE debates SET phase_deadline=?, cierre=? WHERE id=? AND phase='votar'", (new, new, did))
+            else:
+                conn.execute("UPDATE debates SET phase_deadline=? WHERE id=? AND phase=?", (new, did, ph))
+            conn.commit(); return
         if dl is None:
             # Asunto previo a los plazos por fase: se fija el plazo en su 1ª lectura.
             if ph == "votar":
@@ -2910,3 +2995,22 @@ def _audit_compute(e, rows) -> dict:
             "votos": n_ballots,
             "votos_por_via": {v: len(ballots_by_via[v]) for v in VIAS},
             "n_custodios": len(json.loads(_dec(e["trustees_json"]))) if e["trustees_json"] else 0}
+
+
+def reclassify_all() -> int:
+    """v60: aplica la clasificación normalizada a los asuntos PÚBLICOS existentes (idempotente)."""
+    import clasificacion
+    n = 0
+    with db.session() as conn:
+        rows = conn.execute("SELECT id,title,body,materia,administracion,nivel,territorio FROM debates "
+                            "WHERE org_id IS NULL").fetchall()
+        for r in rows:
+            r = dict(r)
+            cl = clasificacion.clasificar(r["title"], r["body"] or "", r["materia"] or "", r["administracion"] or "",
+                                          r["nivel"] or "", r["territorio"] or "")
+            if cl["cambios"]:
+                conn.execute("UPDATE debates SET materia=?, administracion=?, nivel=?, territorio=? WHERE id=?",
+                             (cl["materia"], cl["administracion"], cl["nivel"] or None, cl["territorio"], r["id"]))
+                n += 1
+        conn.commit()
+    return n

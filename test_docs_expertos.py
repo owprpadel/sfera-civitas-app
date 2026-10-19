@@ -255,22 +255,24 @@ real = s.create_debate("Democracia Directa", "", "Democracia", "todas", u[3])["d
 expect_error(lambda: demo_seed.seed(u[0]), 403, "solo el Super Admin crea casos de demostración")
 r = demo_seed.seed(admin)
 items = r["items"]
-check(len(items) == 7 and all(i["status"] == "creado" for i in items), "7 casos creados")
+N = len(demo_seed.CASES)
+check(len(items) == N and all(i["status"] == "creado" for i in items), f"{N} casos creados")
 phases = [i["phase"] for i in items]
-check(phases.count("deliberar") == 2 and phases.count("proponer") == 2 and {"convocar", "votar", "publicar"} <= set(phases),
-      "uno por fase + segundo en Deliberar y en Proponer")
-check(len(r["pending_close"]) == 1, "el caso Publicar queda pendiente del voto del admin (el servidor no vota)")
+check(all(phases.count(ph) >= 2 for ph in ("convocar", "deliberar", "proponer", "votar", "publicar")) and phases.count("votar") >= 3,
+      "al menos 3 asuntos por fase (contando el que pasa de Votar a Publicar)")
+check(len(r["pending_close"]) == 2, "los casos Publicar quedan pendientes del voto del admin (el servidor no vota)")
 check(one("SELECT COUNT(*) AS n FROM bulletin_board WHERE kind='ballot' AND election_id=?",
           (r["pending_close"][0]["election_id"],))["n"] == 0, "el servidor no ha emitido ninguna papeleta")
 r2 = demo_seed.seed(admin)
-check(all(i["status"] == "ya existía" for i in r2["items"]) and len(r2["pending_close"]) == 1, "idempotente (marcador oculto demo_key)")
-s.close_election(r["pending_close"][0]["election_id"], admin)
+check(all(i["status"] == "ya existía" for i in r2["items"]) and len(r2["pending_close"]) == 2, "idempotente (marcador oculto demo_key)")
+for _p in r["pending_close"]:
+    s.close_election(_p["election_id"], admin)
 dids = {i["key"]: i["id"] for i in items}
 for k, v in dids.items():
     g = s.get_debate(v, None)
     check(g["is_demo"] is True and "Ejemplo" not in g["title"], f"{k}: is_demo y título sin «Ejemplo»")
     check("@" not in json.dumps(g), f"{k}: sin emails")
-    if k != "convocar":
+    if not k.startswith("convocar"):
         check(g["apoyos_abierto"] >= s.CONV_QUORUM and len(g["experts"]) >= 2 and len(ds.list_documents(v)) >= 2,
               f"{k}: apoyos ≥ quórum real, 2+ expertos con nombre, 2+ documentos de expertos")
         check(8 <= g["arguments_total"] <= 15, f"{k}: {g['arguments_total']} argumentos")
@@ -289,7 +291,7 @@ check(one("SELECT COUNT(*) AS n FROM expert_profiles WHERE is_demo=1 AND user_id
 check(one("SELECT COUNT(*) AS n FROM users WHERE is_demo=1 AND verified=1")["n"] == 0, "ciudadanía ficticia sin acceso (no verificada)")
 expect_error(lambda: s.login("ciudadania-demo-001@demo.sferacivitas.invalid", "demo-disabled"), 401, "las cuentas ficticias no pueden entrar")
 st = demo_seed.status(admin)
-check(st["demo"]["total"] == 7 and st["legacy"]["total"] == 2, "estado: 7 casos y 2 ejemplos antiguos")
+check(st["demo"]["total"] == N and st["legacy"]["total"] == 2, f"estado: {N} casos y 2 ejemplos antiguos")
 expect_error(lambda: demo_seed.set_visibility(u[0], "legacy", "hide"), 403, "solo el Super Admin oculta ejemplos")
 demo_seed.set_visibility(admin, "legacy", "hide")
 ids_vis = {x["id"] for x in s.list_debates(admin)}

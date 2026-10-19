@@ -25,11 +25,12 @@ while True:
     for p in r["pending_close"]: pend[p["election_id"]] = p
     if rem_prev is not None: check(r["remaining"] < rem_prev or r["remaining"] == 0, f"quedan {r['remaining']}")
     rem_prev = r["remaining"]
-    if not r["remaining"] or vueltas > 12: break
-check(vueltas == 7, f"7 vueltas ({vueltas})")
-check(len(items) == 7 and all(x["status"] == "creado" for x in items.values()), "7 casos creados en total")
+    if not r["remaining"] or vueltas > 30: break
+N = len(demo_seed.CASES)
+check(vueltas == N, f"{N} vueltas ({vueltas})")
+check(len(items) == N and all(x["status"] == "creado" for x in items.values()), f"{N} casos creados en total")
 check(not any(x["status"] == "error" for x in items.values()), "sin errores")
-check(len(pend) == 1, "el caso Publicar queda pendiente de cierre")
+check(len(pend) == 2, "los casos Publicar quedan pendientes de cierre")
 r = demo_seed.seed(admin, max_new=1)
 check(r["remaining"] == 0 and all(x["status"] == "ya existía" for x in r["items"]), "otra pulsación: no duplica")
 for x in items.values():

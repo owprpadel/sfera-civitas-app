@@ -201,6 +201,10 @@ app.add_middleware(CORSMiddleware, allow_origins=[o.strip() for o in _origins],
                    allow_methods=["*"], allow_headers=["*"])
 
 db.init_db()
+try:                                   # v60: clasificación normalizada de los asuntos existentes
+    s.reclassify_all()
+except Exception:
+    import traceback; traceback.print_exc()
 try:
     _demo = s.ensure_demo_account()  # cuenta demo verificada para revisión de tiendas
     print(f"[sfera] demo account: {_demo}")

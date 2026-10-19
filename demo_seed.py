@@ -418,6 +418,8 @@ CASES = [
 ]
 
 
+
+
 # ── v55: ARCHIVOS reales en las bibliotecas (gráficos PNG y PDF generados aquí) ──
 # Gráfico ciudadano por caso: (título, explicación de las barras, valores, sufijo)
 CHARTS = {
@@ -443,6 +445,11 @@ CHARTS = {
                  "Estimación ilustrativa (aprox.) de viajes en una noche de sábado. Verde: 23–1 h (1.200). Azul: 1–3 h (700). "
                  "Naranja: 3–6 h (300).", [1200, 700, 300], ""),
 }
+# v60: casos adicionales para tener al menos 3 asuntos en cada fase.
+from demo_cases_v60 import EXTRA_EXPERTS as _XE, EXTRA_CASES as _XC, EXTRA_CHARTS as _XCH
+EXPERTS.update(_XE)
+CASES.extend(_XC)
+CHARTS.update(_XCH)
 # Enlaces a fuentes OFICIALES, reales y estables (sin inventar noticias)
 OFFICIAL_LINKS = [
     ("dato", "Cifras de población del INE", "Instituto Nacional de Estadística: padrón y cifras de población para dimensionar la propuesta.",
@@ -734,6 +741,10 @@ def seed(admin, max_new=None) -> dict:
         except Exception as e:                   # fallo inesperado: se informa del caso y se sigue (detalle en el registro del servidor)
             import traceback; traceback.print_exc()
             log.append({"key": c["key"], "phase": c["phase"], "status": "error", "error": type(e).__name__})
+    try:                                         # v60: los casos nuevos con la clasificación normalizada
+        import service as _s; _s.reclassify_all()
+    except Exception:
+        pass
     return {"ok": True, "items": log, "pending_close": pending, "remaining": remaining}
 
 

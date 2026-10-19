@@ -34,10 +34,18 @@ def _matches(scope_type, scope_value, debate_row) -> bool:
         return True
     if not debate_row:
         return False
-    if scope_type == "aapp":
-        return (debate_row["administracion"] or "") == scope_value
-    if scope_type == "materia":
-        return (debate_row["materia"] or "") == scope_value
+    if scope_type in ("aapp", "materia"):
+        # v60: coincidencia tolerante (mayúsculas, tildes, espacios), por territorio y con la
+        # clasificación normalizada (clasificacion.py), igual que el aviso a administradores.
+        import clasificacion as _c
+        sv = _c._k(scope_value)
+        if scope_type == "materia":
+            mat = _col(debate_row, "materia") or ""
+            return sv == _c._k(mat) or _c.materia(scope_value or "") == mat
+        adm = _c._k(_col(debate_row, "administracion") or "")
+        terr = _c._k(_col(debate_row, "territorio") or "")
+        return bool(sv) and (sv == adm or adm.startswith(sv + " ") or sv.startswith(adm + " ") and not terr
+                             or bool(terr and terr in sv and (adm.split(" ")[0] in sv or sv == terr)))
     if scope_type == "debate":
         return str(debate_row["id"]) == str(scope_value)
     return False
