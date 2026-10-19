@@ -163,9 +163,11 @@ def add_doc(did: int, user, kind: str, title: str, text: str = "", url: str = ""
         raise SferaError(400, f"El texto no puede superar {TEXT_MAX} caracteres")
     if url and not valid_url(url):
         raise SferaError(400, "El enlace debe empezar por http:// o https:// y ser una dirección web válida")
+    s._forbid_ai(user)                         # v62: el Participante IA no sube documentos
     if not _skip_checks and not user.get("verified"):
         raise SferaError(403, "Verifica tu email para aportar documentos")
     with db.session() as conn:
+        s._forbid_ai(user, conn)
         d = s._load_debate(conn, did, user=user)
         ph = d.get("phase")
         if proposal_id not in (None, "", 0):

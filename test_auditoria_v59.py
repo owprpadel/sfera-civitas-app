@@ -285,7 +285,7 @@ futuro = reg("afuturo@sfera.org")
 check(s.accept_invite(futuro, inv)["org_id"] == oid, "aceptar una invitación")
 inv2 = s.invite_member(dueno, oid, "afuturo2@sfera.org")["token_piloto"]
 s.invite_member(dueno, oid, "afuturo@sfera.org")
-check(s.accept_invite(futuro, inv2)["ok"], "aceptar otra invitación siendo ya socio: sin error")
+expect_error(lambda: s.accept_invite(futuro, inv2), 403, "v61: una invitación personal no vale para otra cuenta", "otro email")
 inv3 = s.invite_member(dueno, oid, "atarde@sfera.org")["token_piloto"]
 sql("UPDATE org_invites SET created=? WHERE token=?", (db.now() - 31 * DAY, inv3))
 expect_error(lambda: s.accept_invite(reg("atarde@sfera.org"), inv3), 410, "invitación de hace 31 días: caducada", "ha caducado")

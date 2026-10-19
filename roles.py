@@ -135,6 +135,9 @@ def grant_role(granter: dict, email: str, role: str, scope_type: str, scope_valu
         if not u:
             raise SferaError(404, "No existe ningún usuario con ese email (debe registrarse primero)")
         uid = u["id"]
+        import service as _s
+        if _s._uid_is_ai(conn, uid):             # v62: la cuenta IA no recibe permisos
+            raise SferaError(400, "El Participante IA no puede recibir permisos de administración ni de experto")
         try:
             conn.execute("""INSERT INTO grants(user_id,role,scope_type,scope_value,granted_by,created)
                             VALUES(?,?,?,?,?,?)""",

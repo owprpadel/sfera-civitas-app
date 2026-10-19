@@ -65,6 +65,9 @@ def assign_expert(did: int, email_or_id, actor: dict) -> dict:
         if not row:
             raise SferaError(404, "No hay ninguna cuenta con ese email (la persona debe registrarse primero)")
         user_id = row["id"]
+        import service as _s
+        if _s._uid_is_ai(conn, user_id):         # v62: la cuenta IA no es experta (participa como ciudadano)
+            raise SferaError(400, "El Participante IA no puede ser experto: participa como un ciudadano más")
         if not conn.execute("SELECT 1 FROM debate_experts WHERE debate_id=? AND user_id=?", (did, user_id)).fetchone():
             conn.execute("INSERT INTO debate_experts(debate_id,user_id,assigned_at) VALUES(?,?,?)",
                          (did, user_id, db.now()))
@@ -181,6 +184,7 @@ def create_document(did, user, doc_type, title, content_kind, content_text=None,
         raise SferaError(400, "El título no puede superar 200 caracteres")
     with db.session() as conn:
         import service as _s
+        _s._forbid_ai(user, conn)                # v62: el Participante IA no sube documentos
         drow = _s._row(conn, did)
         if not drow:
             raise SferaError(404, "Este asunto no existe")
@@ -216,7 +220,9 @@ def create_document(did, user, doc_type, title, content_kind, content_text=None,
 def add_version(document_id, user, content_kind, content_text=None,
                 file_name=None, mime_type=None, data_b64=None) -> dict:
     import moderation
+    import service as _s
     with db.session() as conn:
+        _s._forbid_ai(user, conn)                # v62: el Participante IA no sube documentos
         doc = conn.execute("SELECT * FROM documents WHERE id=?", (document_id,)).fetchone()
         if not doc or int(document_id) in moderation.hidden_ids(conn, "document"):
             raise SferaError(404, "Este documento no existe")
@@ -421,6 +427,8 @@ def add_contribution(document_id, user, kind, text, url=None) -> dict:
         raise SferaError(400, "Tipo de aportación no válido")
     if not (text or "").strip():
         raise SferaError(400, "Escribe tu comentario")
+    import service as _s
+    _s._forbid_ai(user)                          # v62: el Participante IA no aporta a la biblioteca
     if not user.get("verified"):
         raise SferaError(403, "Verifica tu email para comentar")
     if url:

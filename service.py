@@ -161,9 +161,10 @@ def _user_via(user: dict) -> str:
 
 def _conv_counts(conn, did, deadline=None) -> tuple:
     """Apoyos por vía. Con `deadline`, solo cuentan los dados ANTES del fin del plazo (v59)."""
-    extra, params = "", ()
+    # v62: los apoyos de la cuenta IA (no debería haberlos) NUNCA cuentan para el quórum.
+    extra, params = " AND user_id NOT IN (SELECT id FROM users WHERE COALESCE(is_ai,0)=1)", ()
     if deadline is not None:
-        extra, params = " AND (created IS NULL OR created<=?)", (float(deadline),)
+        extra, params = extra + " AND (created IS NULL OR created<=?)", (float(deadline),)
     ab = conn.execute("SELECT COUNT(*) AS n FROM supports WHERE debate_id=? AND via='abierto'" + extra,
                       (did, *params)).fetchone()
     ve = conn.execute("SELECT COUNT(*) AS n FROM supports WHERE debate_id=? AND via='verificado'" + extra,
@@ -196,6 +197,7 @@ def _conv_apply(conn, d, persist=True) -> dict:
                 if cur.rowcount != 0:
                     try: _on_prospera(conn, d, qual)   # avisos in-app + email a admins (asignar expertos)
                     except Exception: pass
+                    _ia_hook(did, "deliberar")         # v62: el Participante IA aporta sus argumentos (en segundo plano)
         elif deadline is not None and db.now() > float(deadline) and _get(d, "is_demo"):
             # v60: los CASOS ILUSTRATIVOS no caducan: se mantienen en su fase (siempre hay ejemplos en cada fase).
             deadline = db.now() + DEMO_KEEPALIVE_DIAS * 86400
@@ -511,13 +513,48 @@ class SferaError(Exception):
 VERIFY_EMAIL_MSG = "Verifica tu email para participar"
 
 
+# ── PARTICIPANTE IA (v62): participa (argumenta y propone) pero NO vota ni apoya ──
+# Defensa en profundidad: la cuenta IA no tiene acceso (no puede entrar), pero además
+# el servidor rechaza cualquier acción reservada a personas aunque llegara a intentarse.
+AI_FORBIDDEN_MSG = ("El Participante IA no puede hacer esto: participa en el debate, pero no vota, "
+                    "no apoya, no marca «útil», no convoca, no sube documentos ni denuncia")
+
+
+def _is_ai(user) -> bool:
+    try:
+        return bool(user and user.get("is_ai"))
+    except Exception:
+        return False
+
+
+def _uid_is_ai(conn, uid) -> bool:
+    if uid is None:
+        return False
+    try:
+        r = conn.execute("SELECT COALESCE(is_ai,0) AS a FROM users WHERE id=?", (uid,)).fetchone()
+    except Exception:          # columna aún sin migrar
+        try: conn._raw.rollback()
+        except Exception: pass
+        return False
+    return bool(r and dict(r).get("a"))
+
+
+def _forbid_ai(user, conn=None) -> None:
+    """Rechaza (403) a la cuenta IA. Con `conn`, lo comprueba también en la BBDD."""
+    if _is_ai(user) or (conn is not None and user and _uid_is_ai(conn, user.get("id"))):
+        raise SferaError(403, AI_FORBIDDEN_MSG)
+
+
 def _require_verified(user) -> None:
     """v59: una cuenta sin el email verificado puede ENTRAR (para verificarlo) pero no participar."""
+    _forbid_ai(user)                       # v62: la IA no apoya, no convoca, no marca «útil», no denuncia…
     if not user or not user.get("verified"):
         raise SferaError(403, VERIFY_EMAIL_MSG)
 
 
 def _require_verified_uid(conn, uid) -> None:
+    if _uid_is_ai(conn, uid):              # v62: la IA publica por su propio módulo (ia_participante), nunca por aquí
+        raise SferaError(403, AI_FORBIDDEN_MSG)
     r = conn.execute("SELECT verified FROM users WHERE id=?", (uid,)).fetchone()
     if not r or not dict(r).get("verified"):
         raise SferaError(403, VERIFY_EMAIL_MSG)
@@ -699,8 +736,8 @@ def resend_code(email: str) -> dict:
 def get_user(uid) -> dict:
     with db.session() as conn:
         row = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
-    if not row or str(row["email"]).endswith("@deleted.invalid"):
-        raise SferaError(401, "Tu sesión no es válida: vuelve a entrar")
+    if not row or str(row["email"]).endswith("@deleted.invalid") or _is_ai(dict(row)):
+        raise SferaError(401, "Tu sesión no es válida: vuelve a entrar")   # v62: la cuenta IA no tiene sesión
     return dict(row)
 
 
@@ -790,11 +827,39 @@ def ensure_demo_account() -> dict:
 
 
 # ── Identidad ────────────────────────────────────────────────────────────────
+
+_EMAIL_RE = re.compile(r"[a-z0-9!#$%&'*+/=?^_`{|}~-]+(\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*@"
+                       r"([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}")
+
+
+def _email_ok(email: str, check_dns: bool = True) -> bool:
+    """v61: email con formato real (usuario@dominio.tld) y, si se puede comprobar, con un
+    dominio que EXISTE. Un dominio inexistente (EAI_NONAME) se rechaza; si el DNS no
+    responde (fallo temporal) no se bloquea a nadie."""
+    email = (email or "").strip().lower()
+    if len(email) > 254 or not _EMAIL_RE.fullmatch(email):
+        return False
+    if not check_dns or os.environ.get("SFERA_EMAIL_DNS", "1") == "0":
+        return True
+    import socket
+    dom = email.rsplit("@", 1)[1]
+    old = socket.getdefaulttimeout()
+    try:
+        socket.setdefaulttimeout(3)
+        socket.getaddrinfo(dom, None)
+        return True
+    except socket.gaierror as e:
+        return e.errno not in (getattr(socket, "EAI_NONAME", -2), getattr(socket, "EAI_NODATA", -5))
+    except Exception:
+        return True
+    finally:
+        socket.setdefaulttimeout(old)
+
 def register(email: str, password: str) -> dict:
     """Registro tipo X (vía abierta): email + contraseña + 2FA. LoA = 'open'."""
     email = (email or "").strip().lower()   # emails sin distinción de mayúsculas (entrar con «Ana@» o «ana@»)
-    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
-        raise SferaError(400, "Escribe un email válido")
+    if not _email_ok(email):
+        raise SferaError(400, "Escribe un email válido (revisa que el dominio exista)")
     if not password or len(password) < 8:
         raise SferaError(400, "La contraseña debe tener al menos 8 caracteres")
     with db.session() as conn:
@@ -869,6 +934,7 @@ def verify_certificate(email: str, cert_subject: str) -> dict:
         row = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
         if not row:
             raise SferaError(404, "Usuario no encontrado")
+        _forbid_ai(dict(row))                # v62: la cuenta IA nunca se verifica
         dup = conn.execute("SELECT 1 FROM users WHERE cert_subject=? AND id<>?", (cert_subject, row["id"])).fetchone()
         if dup:
             raise SferaError(409, "Este certificado ya está vinculado a otra cuenta (una persona, una cuenta)")
@@ -884,8 +950,8 @@ def login(email: str, password: str) -> dict:
         row = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
         if not row:   # sin distinción de mayúsculas (cuentas antiguas guardadas con mayúsculas)
             row = conn.execute("SELECT * FROM users WHERE lower(email)=? ORDER BY id LIMIT 1", (email.lower(),)).fetchone()
-        if not row or not _verify_pw(password, row["pass_hash"]):
-            raise SferaError(401, "Email o contraseña incorrectos")
+        if not row or _is_ai(dict(row)) or not _verify_pw(password, row["pass_hash"]):
+            raise SferaError(401, "Email o contraseña incorrectos")   # v62: la cuenta IA nunca entra
         d = dict(row)
         # Rehash a scrypt si el hash es legacy (migración transparente).
         if not str(row["pass_hash"]).startswith("scrypt$"):
@@ -914,8 +980,8 @@ def _reset_user(conn, email: str):
     if not row:
         return None
     row = dict(row)
-    if str(row["email"]).endswith("@deleted.invalid") or row.get("is_demo") or \
-            str(row.get("pass_hash") or "").startswith(("deleted$", "demo-disabled$")):
+    if str(row["email"]).endswith("@deleted.invalid") or row.get("is_demo") or row.get("is_ai") or \
+            str(row.get("pass_hash") or "").startswith(("deleted$", "demo-disabled$", "ia-disabled$")):
         return None
     return row
 
@@ -986,8 +1052,13 @@ def change_password(uid, old_password: str, new_password: str) -> dict:
 # ── Debates / fases ──────────────────────────────────────────────────────────
 # ── PARTE PRIVADA: organizaciones (colectivos de pago) ────────────────────────
 def _is_org_member(conn, org_id, user_id) -> bool:
-    return bool(conn.execute("SELECT 1 FROM org_members WHERE org_id=? AND user_id=?",
-                             (org_id, user_id)).fetchone())
+    """Miembro ACTIVO (v61: quien entró con código y espera aprobación aún no lo es)."""
+    return bool(conn.execute("SELECT 1 FROM org_members WHERE org_id=? AND user_id=? "
+                             "AND COALESCE(status,'active')='active'", (org_id, user_id)).fetchone())
+
+
+def _in_org_any(conn, org_id, user_id) -> bool:
+    return bool(conn.execute("SELECT 1 FROM org_members WHERE org_id=? AND user_id=?", (org_id, user_id)).fetchone())
 
 
 def _org_role(conn, org_id, user_id):
@@ -1014,11 +1085,14 @@ def create_org(user, name: str) -> dict:
 def list_my_orgs(user) -> list:
     with db.session() as conn:
         rows = [dict(r) for r in conn.execute(
-            "SELECT o.id, o.name, o.plan, m.role, "
-            "(SELECT COUNT(*) FROM org_members mm WHERE mm.org_id=o.id) AS miembros "
+            "SELECT o.id, o.name, o.plan, m.role, COALESCE(m.status,'active') AS status, "
+            "(SELECT COUNT(*) FROM org_members mm WHERE mm.org_id=o.id AND COALESCE(mm.status,'active')='active') AS miembros "
             "FROM organizations o JOIN org_members m ON m.org_id=o.id "
             "WHERE m.user_id=? ORDER BY o.id DESC", (user["id"],)).fetchall()]
     return rows
+
+
+INVITE_TTL_DIAS = 30
 
 
 def invite_member(user, org_id: int, email: str) -> dict:
@@ -1028,6 +1102,8 @@ def invite_member(user, org_id: int, email: str) -> dict:
     email = (email or "").strip().lower()
     if not email:
         raise SferaError(400, "Falta el email a invitar")
+    if not _email_ok(email):
+        raise SferaError(400, "Ese email no es válido o su dominio no existe: revísalo")
     now = db.now()
     with db.session() as conn:
         if _org_role(conn, org_id, user["id"]) != "owner":
@@ -1038,9 +1114,11 @@ def invite_member(user, org_id: int, email: str) -> dict:
         u = conn.execute("SELECT id FROM users WHERE lower(email)=? ORDER BY id LIMIT 1", (email,)).fetchone()
         if u:
             # Comprobar ANTES de insertar (en Postgres un error de integridad anula la transacción).
-            if not _is_org_member(conn, org_id, dict(u)["id"]):
+            if not _in_org_any(conn, org_id, dict(u)["id"]):
                 conn.execute("INSERT INTO org_members(org_id,user_id,role,created) VALUES(?,?,'member',?)",
                              (org_id, dict(u)["id"], now))
+            else:   # v61: si esperaba aprobación, la invitación personal del organizador le da paso
+                conn.execute("UPDATE org_members SET status='active' WHERE org_id=? AND user_id=?", (org_id, dict(u)["id"]))
                 _notify(conn, dict(u)["id"], "org_invite", None,
                         f"Te han añadido a la organización «{dict(org)['name']}» en Sfera Civitas.")
             conn.commit()
@@ -1052,16 +1130,20 @@ def invite_member(user, org_id: int, email: str) -> dict:
                      (org_id, email, token, now))
         conn.commit()
     link = f"{APP_URL}/#invitacion={token}"
-    _send_email(email, f"[Sfera Civitas] Invitación a «{dict(org)['name']}»",
-                f"Te invitan a la organización «{dict(org)['name']}» en Sfera Civitas.\n"
-                f"Regístrate con este email y acepta la invitación aquí:\n{link}")
-    out = {"ok": True, "status": "invited"}
+    sent = _send_email(email, f"[Sfera Civitas] Invitación a «{dict(org)['name']}»",
+                       f"Te invitan a la organización «{dict(org)['name']}» en Sfera Civitas.\n"
+                       f"Regístrate con ESTE email ({email}) y acepta la invitación aquí:\n{link}\n\n"
+                       f"La invitación es personal: solo vale para {email} y caduca en {INVITE_TTL_DIAS} días.")
+    if _mail_configured() and not sent:
+        with db.session() as conn:
+            conn.execute("DELETE FROM org_invites WHERE token=?", (token,)); conn.commit()
+        raise SferaError(502, "No se pudo enviar el email de invitación. Revisa la dirección e inténtalo de nuevo.")
+    out = {"ok": True, "status": "invited", "email": email}
     if not _mail_configured():
         out["token_piloto"] = token  # sin correo aún: se muestra el enlace en la app
     return out
 
 
-INVITE_TTL_DIAS = 30
 
 
 def accept_invite(user, token: str) -> dict:
@@ -1073,9 +1155,15 @@ def accept_invite(user, token: str) -> dict:
         inv = dict(inv)
         if float(inv.get("created") or 0) < now - INVITE_TTL_DIAS * 86400:   # v59: caducan a los 30 días
             raise SferaError(410, "Esta invitación ha caducado: pide a quien organiza que te invite de nuevo")
-        if not _is_org_member(conn, inv["org_id"], user["id"]):      # comprobar antes (Postgres)
+        # v61: la invitación es PERSONAL: solo la puede usar la cuenta con el email invitado.
+        if (inv.get("email") or "").strip().lower() != (user.get("email") or "").strip().lower():
+            raise SferaError(403, f"Esta invitación es para otro email. Entra con la cuenta de ese email "
+                                  f"o pide a quien organiza que te invite con el tuyo.")
+        if not _in_org_any(conn, inv["org_id"], user["id"]):      # comprobar antes (Postgres)
             conn.execute("INSERT INTO org_members(org_id,user_id,role,created) VALUES(?,?,'member',?)",
                          (inv["org_id"], user["id"], now))
+        else:
+            conn.execute("UPDATE org_members SET status='active' WHERE org_id=? AND user_id=?", (inv["org_id"], user["id"]))
         conn.execute("UPDATE org_invites SET used=1 WHERE id=?", (inv["id"],))
         conn.commit()
     return {"ok": True, "org_id": inv["org_id"]}
@@ -1085,10 +1173,135 @@ def list_org_members(user, org_id: int) -> list:
     with db.session() as conn:
         if not _is_org_member(conn, org_id, user["id"]):
             raise SferaError(403, "No perteneces a esta organización")
+        owner = _org_role(conn, org_id, user["id"]) == "owner"
         rows = [dict(r) for r in conn.execute(
-            "SELECT u.email AS email, m.role AS role FROM org_members m JOIN users u ON u.id=m.user_id "
+            "SELECT u.id AS user_id, u.email AS email, m.role AS role, COALESCE(m.status,'active') AS status "
+            "FROM org_members m JOIN users u ON u.id=m.user_id "
             "WHERE m.org_id=? ORDER BY m.role DESC, u.email", (org_id,)).fetchall()]
+    if not owner:
+        rows = [r for r in rows if r["status"] == "active"]
+    for r in rows:
+        if not owner:
+            r.pop("user_id", None)
     return rows
+
+
+# ── v61: CÓDIGO DE GRUPO (el organizador elige: invitación personal por email o código) ──
+_JC_ALPHA = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"      # sin 0/O ni 1/I/L para no confundir
+
+
+def _norm_code(code: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", (code or "").upper())
+
+
+def _new_code() -> str:
+    c = "".join(secrets.choice(_JC_ALPHA) for _ in range(8))
+    return c[:4] + "-" + c[4:]
+
+
+def get_join_code(user, org_id: int) -> dict:
+    with db.session() as conn:
+        if _org_role(conn, org_id, user["id"]) != "owner":
+            raise SferaError(403, "Solo el organizador gestiona el código del espacio")
+        o = dict(conn.execute("SELECT join_code, join_code_on, join_approval FROM organizations WHERE id=?", (org_id,)).fetchone())
+    return {"code": o.get("join_code") if o.get("join_code_on") else None, "on": bool(o.get("join_code_on")),
+            "approval": bool(1 if o.get("join_approval") is None else o.get("join_approval")),
+            "link": (f"{APP_URL}/#unirse={o['join_code']}" if o.get("join_code_on") and o.get("join_code") else None)}
+
+
+def set_join_code(user, org_id: int, on: bool, approval: bool = True, custom: str = None, regenerate: bool = False) -> dict:
+    """Activa/desactiva el código de grupo, exige o no aprobación, lo personaliza o lo cambia.
+    Cambiar el código invalida el anterior al instante."""
+    _require_verified(user)
+    with db.session() as conn:
+        if _org_role(conn, org_id, user["id"]) != "owner":
+            raise SferaError(403, "Solo el organizador gestiona el código del espacio")
+        cur = dict(conn.execute("SELECT join_code FROM organizations WHERE id=?", (org_id,)).fetchone())
+        code = cur.get("join_code")
+        if custom:
+            n = _norm_code(custom)
+            if not (8 <= len(n) <= 20):
+                raise SferaError(400, "El código personalizado debe tener entre 8 y 20 letras o números")
+            if len(set(n)) < 4:
+                raise SferaError(400, "Ese código es demasiado fácil de adivinar: usa más variedad")
+            clash = conn.execute("SELECT id FROM organizations WHERE id<>? AND join_code IS NOT NULL", (org_id,)).fetchall()
+            for r in clash:
+                oc = dict(conn.execute("SELECT join_code FROM organizations WHERE id=?", (dict(r)["id"],)).fetchone())["join_code"]
+                if _norm_code(oc) == n:
+                    raise SferaError(409, "Ese código ya lo usa otro espacio: elige otro")
+            code = custom.strip().upper()
+        elif regenerate or (on and not code):
+            code = _new_code()
+        conn.execute("UPDATE organizations SET join_code=?, join_code_on=?, join_approval=? WHERE id=?",
+                     (code, 1 if on else 0, 1 if approval else 0, org_id))
+        conn.commit()
+    return get_join_code(user, org_id)
+
+
+def join_with_code(user, code: str) -> dict:
+    """Unirse a un espacio con el CÓDIGO DE GRUPO. Cada persona entra con SU cuenta (email
+    verificado): una persona = una cuenta = un voto. También acepta un código de invitación
+    personal (mismo campo en la app)."""
+    raw = (code or "").strip()
+    with db.session() as conn:
+        if conn.execute("SELECT 1 FROM org_invites WHERE token=? AND used=0", (raw,)).fetchone():
+            pass
+        else:
+            raw = None
+    if raw:
+        return accept_invite(user, (code or "").strip())
+    _require_verified(user)
+    n = _norm_code(code)
+    if len(n) < 8:
+        raise SferaError(404, "Código no válido. Revísalo o pide uno nuevo a quien organiza.")
+    now = db.now()
+    with db.session() as conn:
+        org = None
+        for r in conn.execute("SELECT id, name, owner_id, join_code, join_approval FROM organizations "
+                              "WHERE join_code_on=1 AND join_code IS NOT NULL").fetchall():
+            r = dict(r)
+            if _norm_code(r["join_code"]) == n:
+                org = r; break
+        if not org:
+            raise SferaError(404, "Código no válido o desactivado. Pide uno nuevo a quien organiza.")
+        oid = org["id"]
+        if _in_org_any(conn, oid, user["id"]):
+            st = dict(conn.execute("SELECT COALESCE(status,'active') AS s FROM org_members WHERE org_id=? AND user_id=?",
+                                   (oid, user["id"])).fetchone())["s"]
+            return {"ok": True, "org_id": oid, "name": org["name"], "status": st}
+        st = "pending" if (org.get("join_approval") is None or org.get("join_approval")) else "active"
+        conn.execute("INSERT INTO org_members(org_id,user_id,role,status,created) VALUES(?,?,'member',?,?)",
+                     (oid, user["id"], st, now))
+        if st == "pending":
+            _notify(conn, org["owner_id"], "org_invite", None,
+                    f"{user.get('email')} quiere unirse a «{org['name']}» con el código del espacio. Apruébalo en el espacio.")
+        conn.commit()
+        owner_email = dict(conn.execute("SELECT email FROM users WHERE id=?", (org["owner_id"],)).fetchone())["email"]
+    if st == "pending":
+        _send_email_async(owner_email, f"[Sfera Civitas] Solicitud para unirse a «{org['name']}»",
+                          f"{user.get('email')} ha usado el código de «{org['name']}» y espera tu aprobación.\n"
+                          f"Apruébalo o recházalo en el espacio: {APP_URL}/#privado\n")
+    return {"ok": True, "org_id": oid, "name": org["name"], "status": st}
+
+
+def decide_member(user, org_id: int, member_id: int, approve: bool) -> dict:
+    """El organizador aprueba o rechaza a quien espera con el código de grupo."""
+    with db.session() as conn:
+        if _org_role(conn, org_id, user["id"]) != "owner":
+            raise SferaError(403, "Solo el organizador aprueba a los miembros")
+        r = conn.execute("SELECT COALESCE(status,'active') AS s, role FROM org_members WHERE org_id=? AND user_id=?",
+                         (org_id, member_id)).fetchone()
+        if not r or dict(r)["s"] != "pending":
+            raise SferaError(404, "No hay ninguna solicitud pendiente de esa persona")
+        org = dict(conn.execute("SELECT name FROM organizations WHERE id=?", (org_id,)).fetchone())
+        if approve:
+            conn.execute("UPDATE org_members SET status='active' WHERE org_id=? AND user_id=?", (org_id, member_id))
+            _notify(conn, member_id, "org_invite", None, f"Ya formas parte de «{org['name']}».")
+        else:
+            conn.execute("DELETE FROM org_members WHERE org_id=? AND user_id=? AND COALESCE(status,'active')='pending'",
+                         (org_id, member_id))
+        conn.commit()
+    return {"ok": True, "approved": bool(approve)}
 
 
 def list_org_debates(user, org_id: int) -> list:
@@ -1396,6 +1609,7 @@ def create_debate(title, body, materia, administracion, user, nivel="", territor
             raise SferaError(400, f"Los apoyos necesarios deben estar entre 1 y {CONV_QUORUM - 1}")
     now = db.now()
     with db.session() as conn:
+        _forbid_ai(user, conn)                   # v62: la IA no convoca asuntos
         if (plan != "estandar" or qo is not None) and not org_id:
             if not roles.can_admin_new(conn, user, administracion, materia):
                 raise SferaError(403, "Solo la administración puede abrir un proceso exprés o cambiar los apoyos necesarios")
@@ -1410,6 +1624,7 @@ def create_debate(title, body, materia, administracion, user, nivel="", territor
                 (title, body, materia, administracion, (nivel or None), (territorio or None),
                  org_id, user["id"], now + DELIB_DIAS * 86400, now), returning=True)
             conn.commit()
+            _ia_hook(cur.lastrowid, "deliberar")   # v62: nace en Deliberar → el Participante IA también aporta
             return {"debate_id": cur.lastrowid, "phase": "deliberar", "visibility": "private", "org_id": org_id}
         # Público: convocatoria con doble vía
         via = _user_via(user)
@@ -1501,6 +1716,7 @@ def support_debate(did: int, user) -> dict:
     via = _user_via(user)
     now = db.now()
     with db.session() as conn:
+        _forbid_ai(user, conn)                   # v62: la IA no apoya asuntos (ni cuenta para el quórum)
         # v59: visibilidad (privado/moderación) + convocatoria al día (_conv_apply) ANTES de decidir.
         d = _load_debate(conn, did, user=user)
         if d["phase"] != "convocar":
@@ -1807,6 +2023,7 @@ def _phase_apply(conn, did) -> None:
                                (base + _pd(d, "proponer") * 86400, did, d["phase_deadline"]))
             if cur.rowcount != 0:
                 _on_proponer(conn, d)
+                _ia_hook(did, "proponer")        # v62: el Participante IA aporta sus propuestas (en segundo plano)
             conn.commit(); continue
         if ph == "proponer":
             eprops = _expert_proposals(conn, did)
@@ -1861,6 +2078,16 @@ def _phase_apply(conn, did) -> None:
             conn.commit(); return
         conn.commit(); return
 
+
+
+def _ia_hook(did, phase) -> None:
+    """v62: un asunto ENTRA en Deliberar o Proponer → el Participante IA aporta en segundo
+    plano (hilo aparte; nunca bloquea ni rompe la transición). Inerte sin ANTHROPIC_API_KEY."""
+    try:
+        import ia_participante
+        ia_participante.trigger(did, phase, reason="transicion")
+    except Exception as ex:  # pragma: no cover (defensivo)
+        print(f"[sfera] participante IA (transición) en asunto {did}: {ex}")
 
 
 def _refresh(conn, d) -> dict:
@@ -2022,7 +2249,8 @@ def _list_arguments(conn, did, user=None, sort="utiles", stance=None, limit=20, 
     order = "utiles DESC, a.id ASC" if sort == "utiles" else "a.id DESC"
     rows = conn.execute(
         "SELECT a.id AS id, a.debate_id AS debate_id, a.user_id AS user_id, a.stance AS stance, a.text AS text, "
-        "a.created AS created, (SELECT COUNT(*) FROM argument_utiles u WHERE u.argument_id=a.id) AS utiles "
+        "a.created AS created, (SELECT COUNT(*) FROM argument_utiles u WHERE u.argument_id=a.id) AS utiles, "
+        "(SELECT COALESCE(ux.is_ai,0) FROM users ux WHERE ux.id=a.user_id) AS is_ai "
         f"FROM arguments a WHERE a.debate_id=?{fsql}{ssql} ORDER BY {order} LIMIT ? OFFSET ?",
         (did, *fp, *sp, limit, offset)).fetchall()
     items = [dict(r) for r in rows]
@@ -2031,6 +2259,7 @@ def _list_arguments(conn, did, user=None, sort="utiles", stance=None, limit=20, 
         it["stance"] = _norm_stance(it["stance"])
         it["utiles"] = int(it["utiles"] or 0)
         it["util_by_me"] = int(it["id"]) in mine
+        it["is_ai"] = bool(it.get("is_ai"))      # v62: aportación del Participante IA (la web la etiqueta)
     total = counts[stance] if stance else counts["todos"]
     return {"items": items, "total": total, "counts": counts, "sort": sort, "stance": stance or "todos",
             "limit": limit, "offset": offset, "has_more": offset + len(items) < total}
@@ -2048,7 +2277,8 @@ def _list_proposals(conn, did, user=None, sort="apoyos", limit=20, offset=0) -> 
     rows = conn.execute(
         "SELECT p.id AS id, p.debate_id AS debate_id, p.user_id AS user_id, p.text AS text, p.created AS created, "
         "(SELECT COUNT(*) FROM proposal_supports s WHERE s.proposal_id=p.id) AS supports, "
-        "(SELECT COUNT(*) FROM proposal_utiles u WHERE u.proposal_id=p.id) AS utiles "
+        "(SELECT COUNT(*) FROM proposal_utiles u WHERE u.proposal_id=p.id) AS utiles, "
+        "(SELECT COALESCE(ux.is_ai,0) FROM users ux WHERE ux.id=p.user_id) AS is_ai "
         f"FROM proposals p WHERE p.debate_id=?{fsql} ORDER BY {order} LIMIT ? OFFSET ?",
         (did, *fp, limit, offset)).fetchall()
     items = [dict(r) for r in rows]
@@ -2061,6 +2291,7 @@ def _list_proposals(conn, did, user=None, sort="apoyos", limit=20, offset=0) -> 
         it["supported_by_me"] = int(it["id"]) in sup
         it["util_by_me"] = int(it["id"]) in ut
         it["en_papeleta"] = False        # las propuestas ciudadanas NO se votan (compat. con la web anterior)
+        it["is_ai"] = bool(it.get("is_ai"))      # v62: propuesta del Participante IA
     try:
         import citizen_docs as _cd
         dc = _cd.counts_by_proposal(conn, ids, user)
@@ -2255,6 +2486,11 @@ def get_debate(did: int, user=None) -> dict:
             experts_pub = []
             try: conn._raw.rollback()
             except Exception: pass
+    try:                                   # v62: Participante IA perezoso (enfriamiento 12 h; nunca rompe la ficha)
+        import ia_participante
+        ia_participante.maybe_trigger(did, out)
+    except Exception as ex:  # pragma: no cover (defensivo)
+        print(f"[sfera] participante IA (lectura) en asunto {did}: {ex}")
     out.update(_plan_fields(out))
     out.pop("demo_key", None); out.pop("demo_archived", None)
     out["supported_by_me"] = supported
@@ -2370,6 +2606,8 @@ def set_phase(did: int, phase: str, user) -> dict:
                                    f"propuestas de expertos que se votarán (máx. {EXPERT_MAX}).", experts=True, creator=False)
         conn.commit()
         d = _refresh(conn, _row(conn, did))
+    if d["phase"] in ("deliberar", "proponer"):
+        _ia_hook(did, d["phase"])                # v62: avance manual → el Participante IA aporta
     return {"phase": d["phase"], "phase_deadline": d.get("phase_deadline"),
             "phase_dias_restantes": d.get("phase_dias_restantes")}
 
@@ -2464,6 +2702,7 @@ def support_proposal(pid: int, user) -> dict:
     import moderation
     _require_verified(user)
     with db.session() as conn:
+        _forbid_ai(user, conn)                   # v62: la IA no apoya propuestas
         p = conn.execute("SELECT * FROM proposals WHERE id=?", (pid,)).fetchone()
         if not p or int(pid) in moderation.hidden_ids(conn, "proposal"):
             raise SferaError(404, "Propuesta no encontrada")
@@ -2499,6 +2738,7 @@ def toggle_util(kind: str, item_id: int, user, on=None) -> dict:
     _require_verified(user)
     table, utable, col, phase, nf = _UTIL[kind]
     with db.session() as conn:
+        _forbid_ai(user, conn)                   # v62: la IA no marca «útil»
         row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (item_id,)).fetchone()
         if not row or int(item_id) in moderation.hidden_ids(conn, kind):
             raise SferaError(404, nf)
@@ -2710,6 +2950,7 @@ def issue_credential(eid, user, blinded: str, via: str = "open") -> dict:
     v59: UNA papeleta por persona y votación, sea cual sea la vía; quien tiene la cuenta
     verificada con certificado vota en la vía 'verified'."""
     _via_ok(via)
+    _forbid_ai(user)                             # v62: la IA NUNCA vota (no recibe credencial ni papeleta)
     if via == "open" and not user["verified"]:
         raise SferaError(403, "Verifica tu email para poder votar")
     if via == "verified" and user.get("loa") != "verified":
@@ -2717,6 +2958,7 @@ def issue_credential(eid, user, blinded: str, via: str = "open") -> dict:
     if user.get("loa") == "verified" and via != "verified":
         raise SferaError(403, CERT_VIA_MSG)
     with db.session() as conn:
+        _forbid_ai(user, conn)
         e = _election_gate(conn, eid, user)
         n = int(e["blind_open_n"] if via == "open" else e["blind_verified_n"])
         try:

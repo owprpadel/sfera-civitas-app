@@ -29,6 +29,7 @@ import moderation as mod
 import citizen_docs as cdocs
 import experts_service as xs
 import demo_seed
+import ia_participante as ia
 import uploads
 
 app = FastAPI(title="Sfera Civitas — Desarrollo", version="0.1")
@@ -77,6 +78,8 @@ _PATTERN_LIMITS = [
     # v59: invitaciones a organizaciones (cada una envía un email) y su aceptación
     (re.compile(r"^/api/orgs/\d+/invite$"), "invite",
      (int(os.environ.get("SFERA_RL_INVITE", "20")), 3600)),
+    (re.compile(r"^/api/orgs/join$"), "invite_accept",
+     (int(os.environ.get("SFERA_RL_INVITE_ACCEPT", "20")), 3600)),
     (re.compile(r"^/api/orgs/invites/accept$"), "invite_accept",
      (int(os.environ.get("SFERA_RL_INVITE_ACCEPT", "20")), 3600)),
 ]
@@ -210,6 +213,10 @@ try:
     print(f"[sfera] demo account: {_demo}")
 except Exception as _e:
     print(f"[sfera] demo account seed error: {_e}")
+try:                                   # v62: cuenta de sistema «Participante IA» (sin acceso; no vota)
+    print(f"[sfera] participante IA: usuario {ia.ensure_ai_user()} · {'activo' if ia.enabled() else 'inerte (sin ANTHROPIC_API_KEY)'}")
+except Exception as _e:
+    print(f"[sfera] participante IA: {_e}")
 WEB_DIR = os.path.join(os.path.dirname(__file__), "..", "web")
 
 
@@ -345,6 +352,15 @@ class ResolveIn(BaseModel):
     target_type: str; target_id: int; action: str; note: str = ""
 class BlockIn(BaseModel):
     user_id: int
+class JoinCodeIn(BaseModel):
+    on: bool = True
+    approval: bool = True
+    custom: Optional[str] = None
+    regenerate: bool = False
+class JoinIn(BaseModel):
+    code: str
+class DecideIn(BaseModel):
+    approve: bool = True
 
 
 # ── identidad ────────────────────────────────────────────────────────────────
@@ -432,6 +448,15 @@ def list_orgs(u=Depends(current_user)): return _wrap(s.list_my_orgs, u)
 def invite_member(oid: int, i: OrgInviteIn, u=Depends(current_user)): return _wrap(s.invite_member, u, oid, i.email)
 @app.post("/api/orgs/invites/accept")
 def accept_invite(i: InviteAcceptIn, u=Depends(current_user)): return _wrap(s.accept_invite, u, i.token)
+@app.get("/api/orgs/{oid}/joincode")
+def org_joincode(oid: int, u=Depends(current_user)): return _wrap(s.get_join_code, u, oid)
+@app.post("/api/orgs/{oid}/joincode")
+def org_set_joincode(oid: int, i: JoinCodeIn, u=Depends(current_user)):
+    return _wrap(s.set_join_code, u, oid, i.on, i.approval, i.custom, i.regenerate)
+@app.post("/api/orgs/join")
+def org_join(i: JoinIn, u=Depends(current_user)): return _wrap(s.join_with_code, u, i.code)
+@app.post("/api/orgs/{oid}/members/{mid}/decide")
+def org_decide(oid: int, mid: int, i: DecideIn, u=Depends(current_user)): return _wrap(s.decide_member, u, oid, mid, i.approve)
 @app.get("/api/orgs/{oid}/members")
 def org_members(oid: int, u=Depends(current_user)): return _wrap(s.list_org_members, u, oid)
 @app.get("/api/orgs/{oid}/debates")
@@ -596,6 +621,10 @@ def demo_status(u=Depends(current_user)): return _wrap(demo_seed.status, u)
 def demo_seed_run(max: int = 0, u=Depends(current_user)): return _wrap(demo_seed.seed, u, (max if max > 0 else None))
 @app.post("/api/admin/demo/visibility")                  # scope legacy|demo · action hide|show (reversible)
 def demo_visibility(i: DemoVisIn, u=Depends(current_user)): return _wrap(demo_seed.set_visibility, u, i.scope, i.action)
+@app.get("/api/admin/ia/status")                         # v62: estado del Participante IA (Super Admin)
+def ia_status(u=Depends(current_user)): return _wrap(ia.status, u)
+@app.post("/api/admin/ia/run")                           # v62: forzar una tanda en un asunto (Super Admin) · ?debate_id=
+def ia_run(debate_id: int, u=Depends(current_user)): return _wrap(ia.admin_run, u, debate_id)
 @app.get("/api/debates/{did}/myrole")
 def my_role(did: int, u=Depends(current_user)): return _wrap(rl.my_role, u, did)
 

@@ -507,6 +507,25 @@ CREATE TABLE IF NOT EXISTS debate_expert_profiles (   -- perfiles asignados a un
   assigned_at {REAL},
   PRIMARY KEY (debate_id, profile_id)
 );
+-- PARTICIPANTE IA (v62): tandas de aportaciones de la cuenta de sistema «Participante IA».
+-- lock_key = id del asunto MIENTRAS la tanda está en curso (UNIQUE: una sola tanda a la
+-- vez por asunto, también entre procesos); al terminar vuelve a NULL (se permiten varios NULL).
+CREATE TABLE IF NOT EXISTS ia_runs (
+  id {AUTOINC},
+  debate_id INTEGER NOT NULL,
+  phase TEXT NOT NULL,                  -- deliberar | proponer
+  status TEXT NOT NULL,                 -- running | done | invalid | error | skipped | stale
+  detail TEXT,
+  lock_key TEXT UNIQUE,
+  created {REAL},
+  finished {REAL}
+);
+CREATE INDEX IF NOT EXISTS ix_ia_runs_debate ON ia_runs(debate_id);
+-- Límite global de coste: llamadas a la API por día (UTC).
+CREATE TABLE IF NOT EXISTS ia_daily (
+  day TEXT PRIMARY KEY,                 -- AAAA-MM-DD (UTC)
+  calls INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS user_blocks (
   blocker_id INTEGER NOT NULL REFERENCES users(id),
   blocked_id INTEGER NOT NULL REFERENCES users(id),
@@ -655,6 +674,7 @@ _NEW_COLUMNS = [
     ("debates", "dias_vot", "INTEGER"),
     ("debates", "quorum_override", "INTEGER"),             # quórum rebajado por el admin (opcional)
     ("users", "is_demo", "INTEGER DEFAULT 0"),            # ciudadanía ficticia de los casos de demostración (sin acceso)
+    ("users", "is_ai", "INTEGER DEFAULT 0"),              # v62: cuenta de sistema «Participante IA» (sin acceso; delibera y propone, NO vota)
     ("users", "reset_code_hash", "TEXT"),                  # recuperar contraseña: huella del código (nunca el código)
     ("users", "reset_expires", "{REAL}"),                  # caducidad del código (15 min) · DOUBLE PRECISION en PG
     ("users", "twofa_attempts", "INTEGER DEFAULT 0"),     # v59: intentos fallidos del código de verificación (máx. 5)
@@ -671,6 +691,11 @@ _NEW_COLUMNS = [
     ("citizen_docs", "file_size", "INTEGER"),
     ("citizen_docs", "data_b64", "TEXT"),
     ("citizen_docs", "sha256", "TEXT"),
+    # v61: espacios privados — código de grupo (alternativa a la invitación personal por email)
+    ("organizations", "join_code", "TEXT"),
+    ("organizations", "join_code_on", "INTEGER DEFAULT 0"),
+    ("organizations", "join_approval", "INTEGER DEFAULT 1"),
+    ("org_members", "status", "TEXT DEFAULT 'active'"),        # active | pending (espera aprobación)
 ]
 
 
