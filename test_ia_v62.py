@@ -1,6 +1,7 @@
 # Pruebas v62: «Participante IA» — delibera y propone como un ciudadano más, pero NO vota.
 # La API de Anthropic se SIMULA (monkeypatch de ia._http_post): no sale nada a la red.
 import os
+os.environ["SFERA_IA_ON"] = "1"   # v63: la IA va apagada por defecto; las pruebas la encienden
 import json
 import re
 os.environ.setdefault("SFERA_CERT_SIM_ALLOWED", "1")

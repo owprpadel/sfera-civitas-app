@@ -65,8 +65,9 @@ def _api_key() -> str:
 
 
 def enabled() -> bool:
-    """La IA solo actúa con clave de API. Sin clave: módulo inerte."""
-    return bool(_api_key())
+    """v63 (decisión de Carlos, 19-oct): la IA está APAGADA. Solo actuaría con clave de API
+    Y con el interruptor explícito SFERA_IA_ON=1 en el entorno. Sin él: módulo inerte."""
+    return os.environ.get("SFERA_IA_ON", "0") == "1" and bool(_api_key())
 
 
 def model() -> str:
