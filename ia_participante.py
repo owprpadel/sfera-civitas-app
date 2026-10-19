@@ -41,6 +41,7 @@ MAX_ARGS = 3                             # por asunto (uno por postura)
 MAX_PROPS = 2                            # por asunto
 STANCES = ("favor", "contra", "matiz")
 COOLDOWN_H = 12                          # enfriamiento del disparo perezoso
+ERROR_RETRY_S = 30 * 60                  # tras un fallo de la API se reintenta a los 30 min
 LOCK_STALE_S = 15 * 60                   # una tanda «en curso» más antigua se da por muerta
 ARG_MAX_WORDS, PROP_MAX_WORDS = 75, 100  # tope duro (el prompt pide ~60 / ~80)
 ARG_MAX_CHARS, PROP_MAX_CHARS = 650, 900
@@ -354,9 +355,13 @@ def _last_activity(conn, did, uid, phase) -> float:
     r = conn.execute(f"SELECT MAX(created) AS t FROM {tbl} WHERE debate_id=? AND user_id=?", (did, uid)).fetchone()
     if r and dict(r)["t"] is not None:
         t = max(t, float(dict(r)["t"]))
-    r = conn.execute("SELECT MAX(created) AS t FROM ia_runs WHERE debate_id=? AND phase=?", (did, phase)).fetchone()
+    r = conn.execute("SELECT MAX(created) AS t FROM ia_runs WHERE debate_id=? AND phase=? AND status<>'error'", (did, phase)).fetchone()
     if r and dict(r)["t"] is not None:
         t = max(t, float(dict(r)["t"]))
+    # v62.1: una tanda FALLIDA (API caída, sin saldo…) solo bloquea 30 min, no 12 h.
+    r = conn.execute("SELECT MAX(created) AS t FROM ia_runs WHERE debate_id=? AND phase=? AND status='error'", (did, phase)).fetchone()
+    if r and dict(r)["t"] is not None:
+        t = max(t, float(dict(r)["t"]) - (COOLDOWN_H * 3600 - ERROR_RETRY_S))
     return t
 
 
@@ -432,6 +437,7 @@ def run_for_debate(did, expected_phase=None, force=False) -> dict:
             raw = _ask(SYSTEM_PROMPT, _prompt_proponer(c, miss))
             items = validate_props(_parse_json(raw), miss, [p["text"] for p in c["props"]])
     except Exception as ex:
+        print(f"[sfera] participante IA: fallo de la API en asunto {did} ({phase}): {type(ex).__name__}: {_clip(str(ex), 300)}")
         with db.session() as conn:
             _release(conn, run_id, "error", f"API: {ex}")
         return {"ok": False, "error": "fallo al llamar a la API"}
