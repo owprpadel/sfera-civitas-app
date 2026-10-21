@@ -150,7 +150,7 @@ CREATE TABLE IF NOT EXISTS users (
   loa TEXT DEFAULT 'open',              -- nivel de garantía: 'open' (tipo X) | 'verified' (certificado)
   is_admin INTEGER DEFAULT 0,           -- rol de administrador (convocar/abrir/cerrar votaciones)
   is_expert INTEGER DEFAULT 0,          -- rol de experto (autoría de documentos oficiales)
-  cert_subject TEXT,                    -- identificador legible del certificado (CN, solo referencia)
+  cert_subject TEXT,                    -- v64: etiqueta NEUTRA («Verificado con certificado»); NUNCA el nombre
   cert_pid TEXT,                        -- ID PSEUDÓNIMO = HMAC(secreto, NIF). NO guarda el NIF ni el certificado.
                                         -- Desacopla identidad del voto: sirve para "una persona = una cuenta verificada".
   cert_verified_at {REAL},              -- momento de la verificación con certificado real
@@ -371,7 +371,7 @@ CREATE TABLE IF NOT EXISTS bulletin_board (
   payload_json TEXT NOT NULL,
   prev_hash TEXT NOT NULL,
   entry_hash TEXT NOT NULL,
-  created {REAL},
+  created {REAL},                       -- v64: SIEMPRE NULL (sin marcas de tiempo en el tablón)
   UNIQUE (election_id, seq)             -- backstop anti-carrera del nº de secuencia
 );
 
@@ -629,6 +629,18 @@ def init_db():
     # ── Migraciones oct-2026 (idempotentes, ambos backends) ──
     for table, col, ddl in _NEW_COLUMNS:
         _add_column(conn, table, col, ddl)
+    # v64 (RGPD): (1) el nombre de la persona del certificado ya no se guarda: etiqueta neutra;
+    # (2) el tablón de votación no guarda marcas de tiempo (tampoco génesis/resultado).
+    for _sql, _prm in (("UPDATE users SET cert_subject=? WHERE cert_subject IS NOT NULL AND cert_subject<>?",
+                        (CERT_NEUTRAL_LABEL, CERT_NEUTRAL_LABEL)),
+                       ("UPDATE bulletin_board SET created=NULL WHERE created IS NOT NULL", ())):
+        try:
+            conn.execute(_sql, _prm)
+            conn.commit()
+        except Exception as e:   # nunca impide arrancar
+            try: conn._raw.rollback()
+            except Exception: pass
+            print(f"[sfera] migración RGPD v64: {e}")
     # v59: nadie es admin sin haber verificado su email (antes se concedía al registrarse).
     try:
         conn.execute("UPDATE users SET is_admin=0 WHERE COALESCE(verified,0)=0 AND COALESCE(is_admin,0)=1")
@@ -661,6 +673,9 @@ def init_db():
     seed_and_clean(conn)
     conn.close()
 
+
+# v64: etiqueta neutra que sustituye al nombre del certificado en users.cert_subject.
+CERT_NEUTRAL_LABEL = "Verificado con certificado"
 
 # (tabla, columna, tipo) — se añaden si faltan. {REAL} se adapta al backend.
 _NEW_COLUMNS = [
@@ -696,6 +711,12 @@ _NEW_COLUMNS = [
     ("organizations", "join_code_on", "INTEGER DEFAULT 0"),
     ("organizations", "join_approval", "INTEGER DEFAULT 1"),
     ("org_members", "status", "TEXT DEFAULT 'active'"),        # active | pending (espera aprobación)
+    # v64 (RGPD, 21-oct-2026): consentimiento en el registro, caducidad de códigos y cierre de votaciones
+    ("users", "terms_version", "TEXT"),                    # versión de las Condiciones/Privacidad aceptadas (LEGAL_VERSION)
+    ("users", "privacy_accepted_at", "{REAL}"),            # momento del consentimiento explícito (art. 9.2.a RGPD)
+    ("users", "age_confirmed", "INTEGER DEFAULT 0"),      # declara tener 14 años o más (art. 7 LOPDGDD)
+    ("users", "twofa_created", "{REAL}"),                  # momento del último código de verificación (caduca a las 24 h)
+    ("elections", "closed_at", "{REAL}"),                  # cierre real de la votación (retención de credential_issued)
 ]
 
 

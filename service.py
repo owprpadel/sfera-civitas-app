@@ -503,6 +503,40 @@ ADMIN_EMAILS = {e.strip().lower() for e in os.environ.get("SFERA_ADMIN_EMAILS", 
 SFERA_DEV = os.environ.get("SFERA_DEV", "1").lower() not in ("0", "false", "no", "")
 
 
+# ── RGPD (v64, 21-oct-2026): versión de los textos legales y enlaces canónicos ──
+LEGAL_VERSION = "2026-10-21"
+PRIVACY_URL = "https://sferacivitas.org/privacidad.html"
+TERMS_URL = "https://app.sferacivitas.org/terminos.html"
+VOTE_SECRECY_SHORT = "Voto cifrado y secreto: se registra que votas, no qué votas."
+CONSENT_TERMS_MSG = "Para crear la cuenta tienes que aceptar las Condiciones de uso."
+CONSENT_PRIVACY_MSG = ("Para crear la cuenta tienes que leer la Política de privacidad y dar tu consentimiento "
+                       "expreso al tratamiento de tu participación, que puede revelar opiniones políticas.")
+CONSENT_AGE_MSG = "Para crear una cuenta tienes que tener 14 años o más."
+CODE_TTL = 24 * 3600              # un código de verificación de email caduca a las 24 h
+
+
+def legal_info() -> dict:
+    return {"version": LEGAL_VERSION, "privacy_url": PRIVACY_URL, "terms_url": TERMS_URL}
+
+
+def _pilot_codes() -> bool:
+    """v64: el código de verificación solo se devuelve en la respuesta (modo piloto) si NO hay
+    proveedor de correo Y el entorno lo pide expresamente (SFERA_PILOT_CODES=1). Por defecto, no."""
+    return (not _mail_configured()) and os.environ.get("SFERA_PILOT_CODES", "0") == "1"
+
+
+def _code_hash(uid, code: str) -> str:
+    """v64: huella del código de verificación de email (nunca se guarda el código en claro)."""
+    return "h$" + hmac.new(_SECRET, f"2fa:{uid}:{code}".encode(), hashlib.sha256).hexdigest()
+
+
+def _code_ok(uid, stored: str, code: str) -> bool:
+    stored = str(stored or "")
+    if stored.startswith("h$"):
+        return hmac.compare_digest(_code_hash(uid, code), stored)
+    return bool(stored) and hmac.compare_digest(stored, code)   # códigos en claro anteriores al despliegue
+
+
 class SferaError(Exception):
     def __init__(self, status: int, msg: str):
         self.status = status
@@ -724,12 +758,13 @@ def resend_code(email: str) -> dict:
         row = dict(row) if row else None
         if row and not row.get("verified") and not str(row.get("email") or "").endswith("@deleted.invalid"):
             code = f"{secrets.randbelow(1000000):06d}"
-            conn.execute("UPDATE users SET twofa_code=?, twofa_attempts=0 WHERE id=?", (code, row["id"]))
+            conn.execute("UPDATE users SET twofa_code=?, twofa_attempts=0, twofa_created=? WHERE id=?",
+                         (_code_hash(row["id"], code), db.now(), row["id"]))
             conn.commit()
     if code:
         _send_2fa_email(email, code)
-        if not _mail_configured():
-            out["codigo_piloto"] = code   # modo piloto (sin correo): el código se muestra en la app
+        if _pilot_codes():
+            out["codigo_piloto"] = code   # modo piloto (sin correo y SFERA_PILOT_CODES=1): el código se muestra en la app
     return out
 
 
@@ -741,34 +776,243 @@ def get_user(uid) -> dict:
     return dict(row)
 
 
+ANON_EMAIL = "cuenta-eliminada@deleted.invalid"    # v64: autor anónimo de lo publicado por cuentas borradas
+
+
+def _anon_user_id(conn) -> int:
+    """Pseudo-usuario «cuenta eliminada» (sin acceso: email @deleted.invalid y contraseña
+    imposible). Recibe la autoría de las aportaciones públicas de quien borra su cuenta, para
+    que no quede ningún vínculo entre ellas ni con la persona."""
+    r = conn.execute("SELECT id FROM users WHERE email=?", (ANON_EMAIL,)).fetchone()
+    if r:
+        return int(dict(r)["id"])
+    cur = conn.execute("INSERT INTO users(email,pass_hash,verified,loa,is_admin,is_expert,created) "
+                       "VALUES(?,?,0,'open',0,0,?)", (ANON_EMAIL, "deleted$" + secrets.token_hex(16), db.now()),
+                       returning=True)
+    return int(cur.lastrowid)
+
+
+def _safe_exec(conn, sql: str, params=()) -> int:
+    """Ejecuta una sentencia de limpieza sin tumbar la transacción si falla (tabla/columna aún
+    sin migrar). En Postgres usa SAVEPOINT (un error anula la transacción entera)."""
+    pg = db.BACKEND == "postgres"
+    try:
+        if pg:
+            conn.execute("SAVEPOINT sfera_sp")
+        cur = conn.execute(sql, params)
+        n = cur.rowcount
+        if pg:
+            conn.execute("RELEASE SAVEPOINT sfera_sp")
+        return int(n) if n is not None and n >= 0 else 0
+    except Exception as e:
+        if pg:
+            try: conn.execute("ROLLBACK TO SAVEPOINT sfera_sp")
+            except Exception: pass
+        print(f"[sfera] limpieza RGPD: {e} · {sql[:80]}")
+        return 0
+
+
 def delete_account(uid, password: str) -> dict:
     """Eliminación de cuenta desde la app (Apple 5.1.1(v) / RGPD art. 17).
-    Borra los datos personales y vínculos de la cuenta; las aportaciones públicas
-    quedan como 'cuenta eliminada' y los votos ya emitidos son anónimos (no ligados)."""
-    import secrets as _sec
+    v64: se suprime la identidad y se ANONIMIZA todo lo vinculado:
+      · aportaciones públicas (argumentos, propuestas, documentos, aportaciones a documentos,
+        propuestas expertas): pasan al autor anónimo «cuenta eliminada» (se conserva el texto,
+        que forma parte del debate público, sin ningún vínculo con la persona);
+      · apoyos, «útil», notificaciones, retos de certificado, roles, membresías, bloqueos,
+        perfiles de experto vinculados, invitaciones a su email y tickets de soporte: se borran;
+      · registro «ha votado» (credential_issued): se borra (el recuento y la participación salen
+        del tablón, nunca de esta tabla). Las papeletas ya emitidas no tienen identidad;
+      · denuncias que hizo: las pendientes pasan al autor anónimo (la moderación debe seguir),
+        las resueltas se borran;
+      · pagos: se borra el email y el payload bruto (se conservan importe y fecha: obligación fiscal)."""
     with db.session() as conn:
         row = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
         if not row or not _verify_pw(password or "", row["pass_hash"]):
             raise SferaError(403, "Contraseña incorrecta")
+        email = str(dict(row).get("email") or "").strip().lower()
         _hand_over_orgs(conn, uid)          # v59: sus organizaciones no se quedan sin organizador
+        anon = _anon_user_id(conn)
+        X = _safe_exec
+        # 1) Contenido público → autor anónimo (sin borrar el texto del debate)
+        for sql in ("UPDATE arguments SET user_id=? WHERE user_id=?",
+                    "UPDATE proposals SET user_id=? WHERE user_id=?",
+                    "UPDATE citizen_docs SET user_id=? WHERE user_id=?",
+                    "UPDATE document_contributions SET user_id=? WHERE user_id=?",
+                    "UPDATE documents SET created_by=? WHERE created_by=?",
+                    "UPDATE document_versions SET created_by=? WHERE created_by=?",
+                    "UPDATE expert_proposals SET author_id=? WHERE author_id=?"):
+            X(conn, sql, (anon, uid))
+        for sql in ("UPDATE debates SET created_by=NULL WHERE created_by=?",
+                    "UPDATE phase_extensions SET user_id=NULL WHERE user_id=?",
+                    "UPDATE grants SET granted_by=NULL WHERE granted_by=?",
+                    "UPDATE reports SET target_user_id=NULL WHERE target_user_id=?",
+                    "UPDATE reports SET resolved_by=NULL WHERE resolved_by=?",
+                    "UPDATE content_moderation SET updated_by=NULL WHERE updated_by=?",
+                    "UPDATE expert_profiles SET created_by=NULL WHERE created_by=? AND COALESCE(user_id,-1)<>?",
+                    "UPDATE debate_expert_profiles SET assigned_by=NULL WHERE assigned_by=?"):
+            X(conn, sql, tuple([uid] * sql.count("?")))
+        # 2) Denuncias que hizo: pendientes → anónimas (si no chocan con otra del anónimo); el resto, fuera
+        X(conn, "UPDATE reports SET reporter_id=? WHERE reporter_id=? AND COALESCE(status,'pending')='pending' "
+                "AND NOT EXISTS (SELECT 1 FROM reports r2 WHERE r2.reporter_id=? AND r2.target_type=reports.target_type "
+                "AND r2.target_id=reports.target_id)", (anon, uid, anon))
+        X(conn, "DELETE FROM reports WHERE reporter_id=?", (uid,))
+        # 3) Vínculos personales → se borran
         for sql in ("DELETE FROM notifications WHERE user_id=?",
                     "DELETE FROM cert_challenges WHERE user_id=?",
                     "DELETE FROM org_members WHERE user_id=?",
                     "DELETE FROM grants WHERE user_id=?",
                     "DELETE FROM debate_experts WHERE user_id=?",
-                    "DELETE FROM user_blocks WHERE blocker_id=? OR blocked_id=?"):
-            try:
-                n = sql.count("?")
-                conn.execute(sql, tuple([uid] * n))
-            except Exception:
-                pass
+                    "DELETE FROM user_blocks WHERE blocker_id=? OR blocked_id=?",
+                    "DELETE FROM supports WHERE user_id=?",
+                    "DELETE FROM proposal_supports WHERE user_id=?",
+                    "DELETE FROM argument_utiles WHERE user_id=?",
+                    "DELETE FROM proposal_utiles WHERE user_id=?",
+                    "DELETE FROM credential_issued WHERE user_id=?",
+                    "DELETE FROM debate_expert_profiles WHERE profile_id IN (SELECT id FROM expert_profiles WHERE user_id=?)",
+                    "DELETE FROM expert_profiles WHERE user_id=?"):
+            X(conn, sql, tuple([uid] * sql.count("?")))
+        if email and not email.endswith("@deleted.invalid"):
+            X(conn, "DELETE FROM org_invites WHERE lower(email)=?", (email,))
+            X(conn, "UPDATE payments SET email=NULL, raw=NULL WHERE lower(email)=?", (email,))
+            X(conn, "DELETE FROM support_tickets WHERE lower(from_email)=? OR lower(from_email) LIKE ?",
+              (email, "%<" + email + ">%"))
+        # 4) La cuenta: sin identidad ni sesión (la fila se conserva solo como lápida técnica)
         conn.execute(
-            "UPDATE users SET email=?, pass_hash=?, verified=0, is_admin=0, is_expert=0, "
-            "cert_subject=NULL, cert_pid=NULL, cert_verified_at=NULL, twofa_code=NULL, "
+            "UPDATE users SET email=?, pass_hash=?, verified=0, is_admin=0, is_expert=0, loa='open', "
+            "cert_subject=NULL, cert_pid=NULL, cert_verified_at=NULL, twofa_code=NULL, twofa_created=NULL, "
+            "reset_code_hash=NULL, reset_expires=NULL, terms_version=NULL, privacy_accepted_at=NULL, age_confirmed=0, "
             "token_ver=COALESCE(token_ver,0)+1 WHERE id=?",
-            (f"deleted-{uid}@deleted.invalid", "deleted$" + _sec.token_hex(16), uid))
+            (f"deleted-{uid}@deleted.invalid", "deleted$" + secrets.token_hex(16), uid))
         conn.commit()
     return {"deleted": True}
+
+
+def export_account(user) -> dict:
+    """v64 · RGPD arts. 15 y 20 (acceso y portabilidad): todos los datos personales de la cuenta
+    en JSON. Sin contraseñas ni huellas. NUNCA incluye el contenido de un voto (es imposible:
+    las papeletas no tienen identidad); solo en qué votaciones se emitió la papeleta."""
+    uid = int(user["id"])
+
+    def q(conn, sql, params=()):
+        try:
+            if db.BACKEND == "postgres":
+                conn.execute("SAVEPOINT sfera_exp")
+            rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+            if db.BACKEND == "postgres":
+                conn.execute("RELEASE SAVEPOINT sfera_exp")
+            return rows
+        except Exception as e:
+            if db.BACKEND == "postgres":
+                try: conn.execute("ROLLBACK TO SAVEPOINT sfera_exp")
+                except Exception: pass
+            print(f"[sfera] exportación: {e}")
+            return []
+
+    with db.session() as conn:
+        u = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+        if not u:
+            raise SferaError(404, "Cuenta no encontrada")
+        u = dict(u)
+        email = str(u.get("email") or "").lower()
+        out = {
+            "formato": "sfera-civitas-export-v1",
+            "generado": strftime("%Y-%m-%dT%H:%M:%SZ", gmtime()),
+            "responsable": "LA GARRIDA EMOTIONS S.L. (Sfera Civitas) · hola@sferacivitas.org",
+            "version_textos_legales": LEGAL_VERSION,
+            "perfil": {
+                "id": uid, "email": u.get("email"), "email_verificado": bool(u.get("verified")),
+                "nivel_garantia": u.get("loa"), "administracion": bool(u.get("is_admin")),
+                "experto": bool(u.get("is_expert")), "creada": u.get("created"),
+                "verificada_con_certificado": bool(u.get("cert_pid")),
+                "certificado_verificado_en": u.get("cert_verified_at"),
+                "nota_certificado": "Del certificado solo se guarda una huella cifrada (HMAC) del NIF; ni el NIF, ni el nombre, ni el certificado.",
+            },
+            "consentimientos": {"version_aceptada": u.get("terms_version"),
+                                "privacidad_aceptada_en": u.get("privacy_accepted_at"),
+                                "declara_14_anos_o_mas": bool(u.get("age_confirmed"))},
+            "organizaciones": q(conn, "SELECT o.id AS org_id, o.name AS nombre, m.role AS rol, COALESCE(m.status,'active') AS estado, "
+                                      "m.created AS desde FROM org_members m JOIN organizations o ON o.id=m.org_id WHERE m.user_id=?", (uid,)),
+            "roles": q(conn, "SELECT role AS rol, scope_type AS ambito, scope_value AS valor, created AS desde FROM grants WHERE user_id=?", (uid,)),
+            "asuntos_convocados": q(conn, "SELECT id, title AS titulo, created AS creado FROM debates WHERE created_by=?", (uid,)),
+            "apoyos_a_asuntos": q(conn, "SELECT s.debate_id, d.title AS titulo, s.via, s.created AS fecha FROM supports s "
+                                        "LEFT JOIN debates d ON d.id=s.debate_id WHERE s.user_id=?", (uid,)),
+            "apoyos_a_propuestas": q(conn, "SELECT proposal_id, created AS fecha FROM proposal_supports WHERE user_id=?", (uid,)),
+            "marcas_util_argumentos": q(conn, "SELECT argument_id, created AS fecha FROM argument_utiles WHERE user_id=?", (uid,)),
+            "marcas_util_propuestas": q(conn, "SELECT proposal_id, created AS fecha FROM proposal_utiles WHERE user_id=?", (uid,)),
+            "argumentos": q(conn, "SELECT id, debate_id, stance AS postura, text AS texto, created AS fecha FROM arguments WHERE user_id=?", (uid,)),
+            "propuestas": q(conn, "SELECT id, debate_id, text AS texto, created AS fecha FROM proposals WHERE user_id=?", (uid,)),
+            "documentos_aportados": q(conn, "SELECT id, debate_id, proposal_id, kind AS tipo, title AS titulo, text AS texto, url, "
+                                            "file_name AS archivo, created AS fecha FROM citizen_docs WHERE user_id=?", (uid,)),
+            "aportaciones_a_documentos": q(conn, "SELECT id, document_id, kind AS tipo, text AS texto, url, created AS fecha "
+                                                 "FROM document_contributions WHERE user_id=?", (uid,)),
+            "documentos_de_experto": q(conn, "SELECT id, debate_id, doc_type AS tipo, title AS titulo, created AS fecha FROM documents WHERE created_by=?", (uid,)),
+            "propuestas_de_experto": q(conn, "SELECT id, debate_id, title AS titulo, text AS texto, created AS fecha FROM expert_proposals WHERE author_id=?", (uid,)),
+            "perfil_de_experto": q(conn, "SELECT display_name AS nombre, specialty AS especialidad, credentials AS credenciales, "
+                                         "organization AS organizacion, created AS creado FROM expert_profiles WHERE user_id=?", (uid,)),
+            "notificaciones": q(conn, "SELECT kind AS tipo, debate_id, text AS texto, read AS leida, created AS fecha FROM notifications WHERE user_id=?", (uid,)),
+            "invitaciones_recibidas": q(conn, "SELECT org_id, used AS usada, created AS fecha FROM org_invites WHERE lower(email)=?", (email,)),
+            "invitaciones_enviadas": q(conn, "SELECT i.org_id, i.email, i.used AS usada, i.created AS fecha FROM org_invites i "
+                                             "JOIN org_members m ON m.org_id=i.org_id AND m.user_id=? AND m.role='owner'", (uid,)),
+            "pagos": q(conn, "SELECT provider AS proveedor, status AS estado, amount_cents AS importe_centimos, currency AS moneda, "
+                             "units AS unidades, created AS fecha FROM payments WHERE lower(email)=?", (email,)),
+            "denuncias_realizadas": q(conn, "SELECT target_type AS tipo, target_id, reason AS motivo, text AS texto, status AS estado, "
+                                            "created AS fecha FROM reports WHERE reporter_id=?", (uid,)),
+            "usuarios_bloqueados": q(conn, "SELECT blocked_id, created AS fecha FROM user_blocks WHERE blocker_id=?", (uid,)),
+            "soporte": q(conn, "SELECT subject AS asunto, status AS estado, created AS fecha FROM support_tickets "
+                               "WHERE lower(from_email)=? OR lower(from_email) LIKE ?", (email, "%<" + email + ">%")),
+            "votaciones_con_papeleta_emitida": q(conn,
+                "SELECT c.election_id, e.debate_id, e.question AS pregunta, c.via, c.issued_at AS dia "
+                "FROM credential_issued c LEFT JOIN elections e ON e.id=c.election_id WHERE c.user_id=?", (uid,)),
+            "nota_voto": VOTE_SECRECY_SHORT + " El contenido de tu voto no está ligado a tu cuenta y no puede exportarse.",
+        }
+    return out
+
+
+# ── Retención (v64): aplica la tabla de plazos de 00_HECHOS_Y_TEXTOS_CANONICOS.md ──
+DAY = 86400
+RET_NOTIF_DIAS = 180
+RET_CODES_H = 24
+RET_INVITE_EXTRA_DIAS = 30           # 30 días tras caducar (las invitaciones caducan a los INVITE_TTL_DIAS)
+RET_SUPPORT_DIAS = 365
+RET_PAY_RAW_DIAS = 30
+RET_REPORTS_DIAS = 365
+RET_CRED_DIAS = 90
+
+
+def purge_expired(now=None) -> dict:
+    """Borra/minimiza lo que ha superado su plazo de conservación. Idempotente; nunca toca
+    papeletas ni el tablón (permanentes y sin identidad) ni los pagos (6 años: solo se
+    minimiza su payload bruto)."""
+    now = float(now if now is not None else db.now())
+    X = _safe_exec
+    out = {}
+    with db.session() as conn:
+        out["notificaciones"] = X(conn, "DELETE FROM notifications WHERE created < ?", (now - RET_NOTIF_DIAS * DAY,))
+        out["retos_certificado"] = X(conn, "DELETE FROM cert_challenges WHERE COALESCE(created, expires) < ?",
+                                     (now - RET_CODES_H * 3600,))
+        # códigos de verificación: los anteriores a v64 (sin fecha) empiezan a contar ahora
+        X(conn, "UPDATE users SET twofa_created=? WHERE twofa_code IS NOT NULL AND twofa_created IS NULL", (now,))
+        out["codigos_verificacion"] = X(conn, "UPDATE users SET twofa_code=NULL, twofa_attempts=0 "
+                                              "WHERE twofa_code IS NOT NULL AND twofa_created < ?", (now - RET_CODES_H * 3600,))
+        out["codigos_contrasena"] = X(conn, "UPDATE users SET reset_code_hash=NULL, reset_expires=NULL, reset_attempts=0 "
+                                            "WHERE reset_code_hash IS NOT NULL AND COALESCE(reset_expires,0) < ?",
+                                      (now - RET_CODES_H * 3600,))
+        out["invitaciones"] = X(conn, "DELETE FROM org_invites WHERE created < ?",
+                                (now - (INVITE_TTL_DIAS + RET_INVITE_EXTRA_DIAS) * DAY,))
+        out["tickets_soporte"] = X(conn, "DELETE FROM support_tickets WHERE (status IN ('resuelto','escalado') "
+                                         "AND COALESCE(updated, created) < ?) OR COALESCE(updated, created) < ?",
+                                   (now - RET_SUPPORT_DIAS * DAY, now - 2 * RET_SUPPORT_DIAS * DAY))
+        out["pagos_payload"] = X(conn, "UPDATE payments SET raw=NULL WHERE raw IS NOT NULL AND created < ?",
+                                 (now - RET_PAY_RAW_DIAS * DAY,))
+        out["denuncias"] = X(conn, "DELETE FROM reports WHERE COALESCE(status,'pending')<>'pending' "
+                                   "AND resolved_at IS NOT NULL AND resolved_at < ?", (now - RET_REPORTS_DIAS * DAY,))
+        # «Ha votado»: hasta el cierre + 90 días; luego se borra (los totales salen del tablón).
+        X(conn, "UPDATE elections SET closed_at=? WHERE status<>'abierta' AND closed_at IS NULL", (now,))
+        out["registro_ha_votado"] = X(conn, "DELETE FROM credential_issued WHERE election_id IN "
+                                            "(SELECT id FROM elections WHERE status<>'abierta' AND closed_at IS NOT NULL "
+                                            "AND closed_at < ?)", (now - RET_CRED_DIAS * DAY,))
+        conn.commit()
+    return out
 
 
 def _hand_over_orgs(conn, uid) -> None:
@@ -855,8 +1099,18 @@ def _email_ok(email: str, check_dns: bool = True) -> bool:
     finally:
         socket.setdefaulttimeout(old)
 
-def register(email: str, password: str) -> dict:
-    """Registro tipo X (vía abierta): email + contraseña + 2FA. LoA = 'open'."""
+def register(email: str, password: str, accept_terms=True, accept_privacy=True, age_14=True) -> dict:
+    """Registro tipo X (vía abierta): email + contraseña + 2FA. LoA = 'open'.
+    v64 (RGPD): exige aceptar las Condiciones, el consentimiento EXPLÍCITO de la Política de
+    privacidad (art. 9.2.a: la participación puede revelar opiniones políticas) y declarar
+    tener 14 años o más (art. 7 LOPDGDD). La API (main.py) los envía tal cual llegan de la
+    app (por defecto False); se guarda la versión aceptada y el momento."""
+    if accept_terms is not True:
+        raise SferaError(400, CONSENT_TERMS_MSG)
+    if accept_privacy is not True:
+        raise SferaError(400, CONSENT_PRIVACY_MSG)
+    if age_14 is not True:
+        raise SferaError(400, CONSENT_AGE_MSG)
     email = (email or "").strip().lower()   # emails sin distinción de mayúsculas (entrar con «Ana@» o «ana@»)
     if not _email_ok(email):
         raise SferaError(400, "Escribe un email válido (revisa que el dominio exista)")
@@ -867,18 +1121,21 @@ def register(email: str, password: str) -> dict:
             raise SferaError(400, "Email ya registrado")
         code = f"{secrets.randbelow(1000000):06d}"
         # v59: NUNCA admin antes de verificar el email (lo concede verify()).
+        now = db.now()
         cur = conn.execute(
-            "INSERT INTO users(email,pass_hash,verified,loa,is_admin,twofa_code,twofa_attempts,created) "
-            "VALUES(?,?,0,'open',0,?,0,?)",
-            (email, _hash_pw(password), code, db.now()), returning=True)
-        conn.commit()
+            "INSERT INTO users(email,pass_hash,verified,loa,is_admin,twofa_code,twofa_attempts,created,"
+            "terms_version,privacy_accepted_at,age_confirmed,twofa_created) "
+            "VALUES(?,?,0,'open',0,NULL,0,?,?,?,1,?)",
+            (email, _hash_pw(password), now, LEGAL_VERSION, now, now), returning=True)
         uid = cur.lastrowid
+        # v64: solo la HUELLA del código (HMAC), nunca el código en claro.
+        conn.execute("UPDATE users SET twofa_code=? WHERE id=?", (_code_hash(uid, code), uid))
+        conn.commit()
     sent = _send_2fa_email(email, code)
-    out = {"user_id": uid, "email_enviado": sent}
+    out = {"user_id": uid, "email_enviado": sent, "terms_version": LEGAL_VERSION}
     # COHERENCIA: si el correo se envía de verdad, NO se revela el código (verificación real).
-    # Si aún no hay correo configurado (modo piloto), se entrega el código en la app,
-    # etiquetado con honestidad, para que el proceso de verificación funcione igualmente.
-    if not sent:
+    # v64: sin correo, el código solo se entrega en la app si SFERA_PILOT_CODES=1 (pruebas/piloto).
+    if _pilot_codes():
         out["codigo_piloto"] = code
     return out
 
@@ -898,12 +1155,17 @@ def verify(email: str, code: str) -> dict:
         row = dict(row) if row else None
         if not row or not row.get("twofa_code"):
             raise SferaError(400, "Código incorrecto")
+        tc = row.get("twofa_created")
+        if tc is not None and float(tc) < db.now() - CODE_TTL:     # v64: el código caduca a las 24 h
+            conn.execute("UPDATE users SET twofa_code=NULL WHERE id=?", (row["id"],))
+            conn.commit()
+            raise SferaError(400, "El código ha caducado: pide uno nuevo")
         tries = int(row.get("twofa_attempts") or 0)
         if tries >= VERIFY_MAX_TRIES:
             conn.execute("UPDATE users SET twofa_code=NULL WHERE id=?", (row["id"],))
             conn.commit()
             raise SferaError(400, TOO_MANY_CODE_MSG)
-        if not hmac.compare_digest(str(row["twofa_code"]), code):
+        if not _code_ok(row["id"], row["twofa_code"], code):
             tries += 1
             if tries >= VERIFY_MAX_TRIES:
                 conn.execute("UPDATE users SET twofa_code=NULL, twofa_attempts=? WHERE id=?", (tries, row["id"]))
@@ -935,11 +1197,14 @@ def verify_certificate(email: str, cert_subject: str) -> dict:
         if not row:
             raise SferaError(404, "Usuario no encontrado")
         _forbid_ai(dict(row))                # v62: la cuenta IA nunca se verifica
-        dup = conn.execute("SELECT 1 FROM users WHERE cert_subject=? AND id<>?", (cert_subject, row["id"])).fetchone()
+        # v64: no se guarda el sujeto del certificado (puede ser un nombre): solo su huella
+        # HMAC (cert_pid, para «una persona, una cuenta») y una etiqueta neutra.
+        pid = hmac.new(_SECRET, ("SIM:" + cert_subject.strip()).encode(), hashlib.sha256).hexdigest()
+        dup = conn.execute("SELECT 1 FROM users WHERE cert_pid=? AND id<>?", (pid, row["id"])).fetchone()
         if dup:
             raise SferaError(409, "Este certificado ya está vinculado a otra cuenta (una persona, una cuenta)")
-        conn.execute("UPDATE users SET loa='verified', verified=1, cert_subject=? WHERE id=?",
-                     (cert_subject, row["id"]))
+        conn.execute("UPDATE users SET loa='verified', verified=1, cert_pid=?, cert_subject=?, cert_verified_at=? WHERE id=?",
+                     (pid, db.CERT_NEUTRAL_LABEL, db.now(), row["id"]))
         conn.commit()
     return {"loa": "verified", "cert_subject": cert_subject}
 
@@ -1006,7 +1271,7 @@ def forgot_password(email: str) -> dict:
     _send_email_async(email, "Cambia tu contraseña de Sfera Civitas",
                       f"Tu código para poner una contraseña nueva es: {code}\n\n"
                       f"Caduca en {RESET_MIN} minutos. Si no lo has pedido tú, ignora este mensaje: tu contraseña no cambia.")
-    if not _mail_configured():
+    if _pilot_codes():
         out["codigo_piloto"] = code
     return out
 
@@ -1927,7 +2192,7 @@ def _create_election(conn, did, question, options, n_trustees: int = 3) -> int:
                                         "verified": {"n": str(s_ver.n), "e": str(s_ver.e)}}}, sort_keys=True)
     entry_hash = cc.chain_hash("GENESIS", payload)
     conn.execute("INSERT INTO bulletin_board(election_id,seq,kind,via,payload_json,prev_hash,entry_hash,created) VALUES(?,?,?,?,?,?,?,?)",
-                 (eid, 0, "genesis", None, payload, "GENESIS", entry_hash, db.now()))
+                 (eid, 0, "genesis", None, payload, "GENESIS", entry_hash, None))   # v64: sin hora en el tablón
     return eid
 
 
@@ -1953,8 +2218,9 @@ def _tally_close(conn, e) -> dict:
         payload = json.dumps({"via": via, "result": result[via]}, sort_keys=True)
         entry_hash = cc.chain_hash(last["entry_hash"], payload)
         conn.execute("INSERT INTO bulletin_board(election_id,seq,kind,via,payload_json,prev_hash,entry_hash,created) VALUES(?,?,?,?,?,?,?,?)",
-                     (eid, seq, "result", via, payload, last["entry_hash"], entry_hash, db.now()))
-    conn.execute("UPDATE elections SET status='cerrada', result_json=? WHERE id=?", (json.dumps(result), eid))
+                     (eid, seq, "result", via, payload, last["entry_hash"], entry_hash, None))   # v64: sin hora
+    conn.execute("UPDATE elections SET status='cerrada', result_json=?, closed_at=? WHERE id=?",
+                 (json.dumps(result), db.now(), eid))
     conn.execute("UPDATE debates SET phase='publicar', phase_deadline=NULL WHERE id=?", (e["debate_id"],))
     return result
 
@@ -2260,6 +2526,7 @@ def _list_arguments(conn, did, user=None, sort="utiles", stance=None, limit=20, 
         it["utiles"] = int(it["utiles"] or 0)
         it["util_by_me"] = int(it["id"]) in mine
         it["is_ai"] = bool(it.get("is_ai"))      # v62: aportación del Participante IA (la web la etiqueta)
+        it["is_mine"] = bool(user) and it.get("user_id") is not None and int(it["user_id"]) == int(user["id"])
     total = counts[stance] if stance else counts["todos"]
     return {"items": items, "total": total, "counts": counts, "sort": sort, "stance": stance or "todos",
             "limit": limit, "offset": offset, "has_more": offset + len(items) < total}
@@ -2292,6 +2559,7 @@ def _list_proposals(conn, did, user=None, sort="apoyos", limit=20, offset=0) -> 
         it["util_by_me"] = int(it["id"]) in ut
         it["en_papeleta"] = False        # las propuestas ciudadanas NO se votan (compat. con la web anterior)
         it["is_ai"] = bool(it.get("is_ai"))      # v62: propuesta del Participante IA
+        it["is_mine"] = bool(user) and it.get("user_id") is not None and int(it["user_id"]) == int(user["id"])
     try:
         import citizen_docs as _cd
         dc = _cd.counts_by_proposal(conn, ids, user)

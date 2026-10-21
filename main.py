@@ -9,6 +9,7 @@ Arranque:
 from __future__ import annotations
 import os
 import re
+import threading
 import time
 from collections import defaultdict, deque
 from typing import Optional
@@ -33,7 +34,16 @@ import ia_participante as ia
 import uploads
 
 app = FastAPI(title="Sfera Civitas — Desarrollo", version="0.1")
-_origins = os.environ.get("SFERA_CORS", "*").split(",")
+# v64: CORS cerrado a los orígenes de la app (web y apps nativas Capacitor). La web llama a la
+# API por el proxy de Netlify (mismo origen), así que CORS solo afecta a las apps y a pruebas
+# locales. Se puede cambiar con SFERA_CORS_ORIGINS (lista separada por comas). Compatibilidad:
+# si existe la variable antigua SFERA_CORS con orígenes concretos (no «*»), se respeta.
+_DEFAULT_ORIGINS = ["https://app.sferacivitas.org", "https://sferacivitas.org", "capacitor://localhost",
+                    "https://localhost", "http://localhost"]
+_cors_env = (os.environ.get("SFERA_CORS_ORIGINS") or "").strip()
+if not _cors_env and (os.environ.get("SFERA_CORS") or "").strip() not in ("", "*"):
+    _cors_env = os.environ.get("SFERA_CORS", "").strip()
+_origins = [o.strip() for o in _cors_env.split(",") if o.strip()] if _cors_env else list(_DEFAULT_ORIGINS)
 
 # ── Rate limiting (anti-Sybil / anti-fuerza bruta) ────────────────────────────
 # Ventana deslizante en memoria por IP y endpoint sensible. Suficiente para el
@@ -82,6 +92,14 @@ _PATTERN_LIMITS = [
      (int(os.environ.get("SFERA_RL_INVITE_ACCEPT", "20")), 3600)),
     (re.compile(r"^/api/orgs/invites/accept$"), "invite_accept",
      (int(os.environ.get("SFERA_RL_INVITE_ACCEPT", "20")), 3600)),
+    # v64: voto — límite por IP (sin sesión en /cast: el voto no lleva identidad)
+    (re.compile(r"^/api/elections/\d+/credential$"), "credential",
+     (int(os.environ.get("SFERA_RL_CREDENTIAL", "20")), 600)),
+    (re.compile(r"^/api/elections/\d+/cast$"), "cast",
+     (int(os.environ.get("SFERA_RL_CAST", "30")), 600)),
+    # v64: exportar mis datos (cada exportación recorre muchas tablas)
+    (re.compile(r"^/api/account/export$"), "export",
+     (int(os.environ.get("SFERA_RL_EXPORT", "10")), 3600)),
 ]
 _HITS_MAX_KEYS = int(os.environ.get("SFERA_RL_MAX_KEYS", "50000"))   # tope de memoria del limitador
 MAX_BODY_BYTES = 16 * 1024 * 1024                                     # v59: tope de tamaño de una petición
@@ -149,10 +167,70 @@ async def rate_limit(request: Request, call_next):
     if _too_big(request):                       # v59: nada de peticiones gigantes (413)
         return JSONResponse({"detail": "Lo que intentas enviar es demasiado grande (máximo 16 MB)."}, status_code=413)
     limit, key = _limit_for(request.url.path)
-    if limit and request.method == "POST":
+    if limit and (request.method == "POST" or key == "export"):
         if not _hit(_client_ip(request), key, limit, time.time()):
             return JSONResponse({"detail": "Has hecho demasiados envíos seguidos. Espera un rato y vuelve a intentarlo."}, status_code=429)
     return await call_next(request)
+
+
+# v64: cabeceras de seguridad en TODAS las respuestas de la API.
+_SEC_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "X-Frame-Options": "DENY",
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+}
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    resp = await call_next(request)
+    for k, v in _SEC_HEADERS.items():
+        if k not in resp.headers:
+            resp.headers[k] = v
+    return resp
+
+
+# v64 (RGPD, minimización): a quien consulta SIN sesión válida no se le entregan los
+# identificadores internos de las cuentas que aportan (no los necesita: la web solo los usa
+# para «Bloquear usuario» y para marcar lo propio, y ambas cosas requieren sesión).
+_PRIVATE_ID_KEYS = ("user_id", "created_by", "author_id", "target_user_id", "resolved_by",
+                    "granted_by", "assigned_by", "updated_by", "blocked_id", "owner_id")
+_PRIVATE_ID_BYTES = tuple(f'"{k}"'.encode() for k in _PRIVATE_ID_KEYS)
+
+
+def strip_private_ids(obj):
+    if isinstance(obj, dict):
+        return {k: strip_private_ids(v) for k, v in obj.items() if k not in _PRIVATE_ID_KEYS}
+    if isinstance(obj, list):
+        return [strip_private_ids(x) for x in obj]
+    return obj
+
+
+@app.middleware("http")
+async def hide_ids_from_anonymous(request: Request, call_next):
+    resp = await call_next(request)
+    path = request.url.path
+    if request.method != "GET" or not path.startswith("/api/") or path.startswith("/api/files/") \
+            or path == "/api/account/export":
+        return resp
+    if "application/json" not in (resp.headers.get("content-type") or ""):
+        return resp
+    body = b"".join([chunk async for chunk in resp.body_iterator])
+    headers = {k: v for k, v in resp.headers.items() if k.lower() != "content-length"}
+    if any(b in body for b in _PRIVATE_ID_BYTES):
+        auth = request.headers.get("authorization") or ""
+        uid = None
+        if auth.startswith("Bearer "):
+            from starlette.concurrency import run_in_threadpool
+            uid = await run_in_threadpool(s.parse_token, auth[len("Bearer "):].strip())
+        if uid is None:
+            try:
+                import json as _json
+                body = _json.dumps(strip_private_ids(_json.loads(body)), ensure_ascii=False).encode()
+            except Exception:
+                pass
+    return Response(content=body, status_code=resp.status_code, headers=headers)
 
 
 _FILE_URL_RE = re.compile(r"^/api/files/(doc|cdoc)/(\d+)")
@@ -200,7 +278,7 @@ async def sign_file_links(request: Request, call_next):
 
 # CORS se añade DESPUÉS del rate-limit para que sea el middleware MÁS EXTERNO:
 # así incluso las respuestas 429 llevan cabeceras CORS y el navegador puede leerlas.
-app.add_middleware(CORSMiddleware, allow_origins=[o.strip() for o in _origins],
+app.add_middleware(CORSMiddleware, allow_origins=_origins,
                    allow_methods=["*"], allow_headers=["*"])
 
 db.init_db()
@@ -217,6 +295,22 @@ try:                                   # v62: cuenta de sistema «Participante I
     print(f"[sfera] participante IA: usuario {ia.ensure_ai_user()} · {'activo' if ia.enabled() else 'inerte (sin ANTHROPIC_API_KEY)'}")
 except Exception as _e:
     print(f"[sfera] participante IA: {_e}")
+
+
+def _purge_loop():
+    """v64: job de retención (RGPD) al arrancar y luego cada 24 h, en segundo plano.
+    Idempotente: si hay varias instancias, repetirlo no hace daño. SFERA_PURGE=0 lo apaga."""
+    time.sleep(int(os.environ.get("SFERA_PURGE_DELAY", "30")))     # deja arrancar el servidor
+    while True:
+        try:
+            print(f"[sfera] retención RGPD: {s.purge_expired()}", flush=True)
+        except Exception as _e:
+            print(f"[sfera] retención RGPD (error): {_e}", flush=True)
+        time.sleep(24 * 3600)
+
+
+if os.environ.get("SFERA_PURGE", "1") != "0":
+    threading.Thread(target=_purge_loop, name="sfera-retencion", daemon=True).start()
 WEB_DIR = os.path.join(os.path.dirname(__file__), "..", "web")
 
 
@@ -260,6 +354,8 @@ def optional_user(authorization: Optional[str] = Header(None)):
 # ── modelos ──────────────────────────────────────────────────────────────────
 class RegisterIn(BaseModel):
     email: str; password: str
+    # v64 (RGPD): consentimientos del registro; si faltan, el registro se rechaza (400)
+    accept_terms: bool = False; accept_privacy: bool = False; age_14: bool = False
 class VerifyIn(BaseModel):
     email: str; code: str
 class ResendIn(BaseModel):
@@ -365,7 +461,10 @@ class DecideIn(BaseModel):
 
 # ── identidad ────────────────────────────────────────────────────────────────
 @app.post("/api/register")
-def register(i: RegisterIn): return _wrap(s.register, i.email, i.password)
+def register(i: RegisterIn):
+    return _wrap(s.register, i.email, i.password, bool(i.accept_terms), bool(i.accept_privacy), bool(i.age_14))
+@app.get("/api/legal")                                     # v64: versión y enlaces de los textos legales
+def legal(): return s.legal_info()
 @app.post("/api/verify")
 def verify(i: VerifyIn): return _wrap(s.verify, i.email, i.code)
 @app.post("/api/resend")
@@ -424,6 +523,11 @@ def change_password(i: ChangePwIn, u=Depends(current_user)):
 @app.post("/api/account/delete")
 def delete_account(i: DeleteAccountIn, u=Depends(current_user)):
     return _wrap(s.delete_account, u["id"], i.password)
+@app.get("/api/account/export")                            # v64: RGPD arts. 15 y 20 — descargar mis datos (JSON)
+def export_account(u=Depends(current_user)):
+    data = _wrap(s.export_account, u)
+    return JSONResponse(data, headers={"Content-Disposition": 'attachment; filename="sfera-civitas-mis-datos.json"',
+                                       "Cache-Control": "no-store"})
 
 
 # ── debates / fases ──────────────────────────────────────────────────────────
