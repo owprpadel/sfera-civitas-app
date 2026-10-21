@@ -343,6 +343,8 @@ def _eligible(conn, d):
         return "asunto detenido"
     if int(d.get("hidden") or 0) == 1:
         return "asunto archivado"
+    if (d.get("visibility") or "public") != "public" or d.get("org_id") is not None:
+        return "asunto privado (espacio de una organización)"   # v64 (RGPD): nunca en espacios privados
     if int(d["id"]) in moderation.hidden_ids(conn, "debate"):
         return "asunto oculto por moderación"
     return None
@@ -499,6 +501,13 @@ def trigger(did, phase, reason="transicion") -> bool:
     """(a) Disparo AUTOMÁTICO al entrar en Deliberar/Proponer. Sin bloquear la petición.
     Ignora el enfriamiento (es la primera aportación de la fase)."""
     if not AUTO or not enabled() or phase not in PHASES_IA:
+        return False
+    try:                                   # v64 (RGPD): nunca en asuntos privados de una organización
+        with db.session() as conn:
+            r = conn.execute("SELECT visibility, org_id FROM debates WHERE id=?", (int(did),)).fetchone()
+        if r and ((dict(r).get("visibility") or "public") != "public" or dict(r).get("org_id") is not None):
+            return False
+    except Exception:
         return False
     return _launch(int(did), phase, force=True)
 

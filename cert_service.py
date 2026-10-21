@@ -52,7 +52,8 @@ import time
 import db
 
 MODE = os.environ.get("SFERA_CERT_MODE", "sim").lower()
-SECRET = (os.environ.get("SFERA_SECRET", "sfera-dev-secret")).encode()
+# v64: MISMA fuente y MISMO valor por defecto que service._SECRET (antes había otro distinto).
+SECRET = (os.environ.get("SFERA_SECRET") or "DEV-INSECURE-SECRET-cambiar-en-produccion").encode()
 if not os.environ.get("SFERA_SECRET") and db.BACKEND == "postgres":   # v59: aviso RUIDOSO, sin caer
     import sys as _sys
     print("[sfera] PELIGRO (cert_service): SFERA_SECRET sin configurar en producción: el identificador "
@@ -191,7 +192,7 @@ def verify(email: str, nonce_id, signature_b64: str, cert_pem: str,
             raise CertError(409, "Este certificado ya verifica otra cuenta (una persona, una identidad)")
         conn.execute(
             "UPDATE users SET loa='verified', verified=1, cert_pid=?, cert_subject=?, cert_verified_at=? "
-            "WHERE email=?", (pid, display[:120], db.now(), email))
+            "WHERE email=?", (pid, db.CERT_NEUTRAL_LABEL, db.now(), email))   # v64: nunca el nombre
         conn.commit()
     return {"loa": "verified", "mode": MODE, "identidad": display,
             "nota": "Identidad verificada y DESACOPLADA del voto (no se guarda el certificado ni el NIF)"}
@@ -613,7 +614,7 @@ def _mark_verified_sim(email: str, cert_ref: str) -> dict:
         if dup:
             raise CertError(409, "Este certificado ya verifica otra cuenta (una persona, una identidad)")
         conn.execute("UPDATE users SET loa='verified', verified=1, cert_pid=?, cert_subject=?, cert_verified_at=? "
-                     "WHERE email=?", (pid, ref[:120], db.now(), email))
+                     "WHERE email=?", (pid, db.CERT_NEUTRAL_LABEL, db.now(), email))   # v64: nunca la referencia
         conn.commit()
     return {"loa": "verified", "mode": "sim",
             "nota": "SIMULADO (desarrollo): configura SFERA_CERT_MODE=pilot y el trust_store para validar de verdad"}
