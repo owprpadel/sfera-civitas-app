@@ -25,6 +25,7 @@ import service as s
 import docs_service as ds
 import roles as rl
 import cert_service as cs
+import afirma_bridge as afb
 import support_service as sup
 import moderation as mod
 import citizen_docs as cdocs
@@ -309,6 +310,23 @@ def _purge_loop():
         time.sleep(24 * 3600)
 
 
+def _trust_boot():
+    """v65: con certificado real activo, descarga y verifica las CAs oficiales (DNIe/FNMT)
+    y precarga el autoscript.js fijado, en segundo plano para no retrasar el arranque."""
+    time.sleep(5)
+    try:
+        print(f"[sfera] CAs oficiales: {cs.ensure_trust_store(force=True)}", flush=True)
+    except Exception as _e:
+        print(f"[sfera] CAs oficiales (error): {_e}", flush=True)
+    try:
+        afb.autoscript(); print("[sfera] autoscript.js oficial verificado", flush=True)
+    except Exception as _e:
+        print(f"[sfera] autoscript.js (error): {_e}", flush=True)
+
+
+if cs.MODE in ("pilot", "strict"):
+    threading.Thread(target=_trust_boot, name="sfera-trust", daemon=True).start()
+
 if os.environ.get("SFERA_PURGE", "1") != "0":
     threading.Thread(target=_purge_loop, name="sfera-retencion", daemon=True).start()
 WEB_DIR = os.path.join(os.path.dirname(__file__), "..", "web")
@@ -485,6 +503,46 @@ def _wrap_cert(fn, *a, **k):
 
 @app.get("/api/cert/status")
 def cert_status(): return cs.status()
+
+
+# v65 — Puente con AutoFirma / Cliente @firma móvil (ver afirma_bridge.py)
+@app.get("/api/afirma/autoscript.js")
+def afirma_autoscript():
+    try:
+        js = afb.autoscript()
+    except Exception as e:
+        print(f"[sfera] autoscript.js no disponible: {e}", flush=True)
+        raise HTTPException(503, "El componente de firma no está disponible ahora mismo. Inténtalo en unos minutos.")
+    return Response(content=js, media_type="application/javascript; charset=utf-8",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
+async def _afirma_params(request: Request) -> dict:
+    from urllib.parse import parse_qsl
+    params = dict(request.query_params)
+    if request.method == "POST":
+        raw = (await request.body()).decode("utf-8", "replace")
+        params.update(dict(parse_qsl(raw, keep_blank_values=True)))
+    return params
+
+
+_AFIRMA_HEADERS = {"Access-Control-Allow-Origin": "*", "Cache-Control": "no-store"}
+
+
+@app.api_route("/api/afirma/storage", methods=["GET", "POST"])
+async def afirma_storage(request: Request):
+    p = await _afirma_params(request)
+    out = afb.storage(p)
+    if p.get("op") == "check":
+        out += "\n"
+    return Response(content=out, media_type="text/plain; charset=utf-8", headers=_AFIRMA_HEADERS)
+
+
+@app.api_route("/api/afirma/retrieve", methods=["GET", "POST"])
+async def afirma_retrieve(request: Request):
+    p = await _afirma_params(request)
+    return Response(content=afb.retrieve(p) + "\n", media_type="text/plain; charset=utf-8",
+                    headers=_AFIRMA_HEADERS)
 # ── Soporte desatendido (soporte@): acuse + FAQ + escalado. Cron-key o admin. ──
 @app.post("/api/support/run")
 def support_run(x_sfera_cron: Optional[str] = Header(None),

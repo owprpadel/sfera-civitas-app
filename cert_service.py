@@ -407,6 +407,94 @@ def _match_signer(sid, certs):
     return None
 
 
+# v65 — CAs OFICIALES de confianza para identificar PERSONAS (DNIe y FNMT).
+# El servidor las descarga de las webs oficiales al arrancar y SOLO las acepta si la huella
+# SHA-1 del certificado (DER) coincide con la publicada por la FNMT y la Policía (comprobado
+# el 03-nov-2026). Fuentes: sede.fnmt.gob.es/descargas/certificados-raiz-de-la-fnmt y
+# dnielectronico.es (Área de descargas → Autoridades de Certificación y Validación).
+_FNMT = "https://www.sede.fnmt.gob.es/documents/10445900/10526749/"
+_DNIE = "https://www.dnielectronico.es/ZIP/"
+OFFICIAL_CAS = [
+    # (fichero local, URL oficial, huella SHA-1 oficial del certificado)
+    ("fnmt_ac_raiz_fnmt-rcm.pem",  _FNMT + "AC_Raiz_FNMT-RCM_SHA256.cer", "ec503507b215c4956219e2a89a5b42992c4c2c20"),
+    ("fnmt_ac_fnmt_usuarios.pem",  _FNMT + "AC_FNMT_Usuarios.cer",        "808b72e43b574cf5877cb841a8df88396d38ab94"),
+    ("fnmt_ac_representacion.pem", _FNMT + "AC_Representacion.cer",       "eeebd3f6990b036d79d504ea7e4ec7c1ee2a8c13"),
+    ("fnmt_ac_raiz_g2.pem",        _FNMT + "AC_Raiz_FNMT-RCM_G2.cer",     "a4d6b770e765a9bf17ecd7b5e03b852d612fa71d"),
+    ("fnmt_ac_usuarios_g2.pem",    _FNMT + "AC_Usuarios_G2.cer",          "e9f499a0efeff7a60e9fe6b52fa3a8febbbdba0a"),
+    ("fnmt_ac_representacion_g2.pem", _FNMT + "AC_Representacion_G2.cer", "ea14f87a91b6a62c6d5f40b5642520380ec1c12a"),
+    ("dnie_ac_raiz_dnie_2.pem",    _DNIE + "ACRAIZ-DNIE2.zip",            "eb4d6902fd60ecd50ee58e2c9f20292c391027ce"),
+    ("dnie_ac_raiz_dnie_sha2.pem", _DNIE + "ACRAIZ-SHA2.zip",             "2229f056d34d1cb63e986f26b2d08ab94ff08e4d"),
+    ("dnie_ac_dnie_004.pem",       _DNIE + "ACDNIE004.crt.zip",           "3f7a70b98273db7e026b95da49e9b6930d65829a"),
+    ("dnie_ac_dnie_005.pem",       _DNIE + "ACDNIE005.crt.zip",           "e70cf3b6c8567629b69be8c95d63d9040085c195"),
+    ("dnie_ac_dnie_006.pem",       _DNIE + "ACDNIE006.crt.zip",           "423bb49739ea4e1be6f47161eab8977bf655b7ee"),
+]
+_TRUST_LOCK = __import__("threading").Lock()
+_TRUST_LAST_TRY = [0.0]
+
+
+def _der_candidates(blob: bytes):
+    """Certificados (DER) contenidos en un .cer/.crt (DER o PEM) o en un .zip oficial."""
+    import base64, io, zipfile
+    out = []
+    if blob[:2] == b"PK":
+        try:
+            with zipfile.ZipFile(io.BytesIO(blob)) as z:
+                for n in z.namelist():
+                    if n.lower().endswith((".crt", ".cer", ".pem", ".der")):
+                        out += _der_candidates(z.read(n))
+        except Exception:
+            pass
+        return out
+    if b"-----BEGIN CERTIFICATE-----" in blob:
+        for part in _split_pem(blob):
+            body = b"".join(l for l in part.splitlines() if l and not l.startswith(b"-----"))
+            try:
+                out.append(base64.b64decode(body))
+            except Exception:
+                pass
+        return out
+    return [blob]
+
+
+def ensure_trust_store(force: bool = False) -> dict:
+    """Descarga las CAs oficiales que falten, verificando su huella. Idempotente.
+    Devuelve {fichero: 'ok'|'ya estaba'|'error: …'}."""
+    import urllib.request
+    res = {}
+    with _TRUST_LOCK:
+        now = time.time()
+        if not force and now - _TRUST_LAST_TRY[0] < 600 and _TRUST_LAST_TRY[0]:
+            return {"skipped": "reintento en menos de 10 min"}
+        _TRUST_LAST_TRY[0] = now
+        os.makedirs(TRUSTDIR, exist_ok=True)
+        for fn, url, sha1 in OFFICIAL_CAS:
+            path = os.path.join(TRUSTDIR, fn)
+            if os.path.exists(path):
+                res[fn] = "ya estaba"
+                continue
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "SferaCivitas-trust/1.0"})
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    blob = r.read(2 * 1024 * 1024)
+                der = next((d for d in _der_candidates(blob) if hashlib.sha1(d).hexdigest() == sha1), None)
+                if der is None:
+                    res[fn] = "error: la huella no coincide con la oficial"
+                    continue
+                cert = x509.load_der_x509_certificate(der)
+                with open(path, "wb") as fh:
+                    fh.write(cert.public_bytes(serialization.Encoding.PEM))
+                res[fn] = "ok"
+            except Exception as e:
+                res[fn] = f"error: {e}"
+    return res
+
+
+def _trust_files_ok() -> bool:
+    """¿Hay al menos una CA oficial de personas (DNIe o FNMT Usuarios) instalada?"""
+    return any(os.path.exists(os.path.join(TRUSTDIR, fn)) for fn, _, _ in OFFICIAL_CAS
+               if "usuarios" in fn or "dnie_ac_dnie" in fn)
+
+
 # Raíces que NO deben usarse para identificar personas (p. ej. la raíz de servidores TLS
 # de la FNMT): si su fichero está en el directorio de confianza, se ignora (v59).
 _EXCLUDED_ROOT_FILES = ("servidoresseguros",)
@@ -463,6 +551,9 @@ def _validate_certificate(cert, extra_certs=()):
         raise CertError(403, "Certificado todavía no válido")
 
     roots = _load_trust_roots()
+    if not roots and MODE in ("pilot", "strict"):
+        ensure_trust_store()                       # v65: por si el arranque no pudo descargarlas
+        roots = _load_trust_roots()
 
     if MODE == "strict":
         if not _CERTVALIDATOR:
@@ -485,7 +576,9 @@ def _validate_certificate(cert, extra_certs=()):
     # los intermedios incluidos en la firma, hasta llegar a una RAÍZ de confianza.
     # Verifica la firma de cada eslabón. Sin trust store aún: solo vigencia.
     if not roots:
-        return  # piloto sin trust store: solo vigencia + firma del nonce ya verificada
+        # v65: SIN CAs de confianza NO se verifica a nadie (antes bastaba la vigencia y una
+        # firma correcta: cualquiera con un certificado autofirmado habría pasado).
+        raise CertError(503, "La verificación con certificado no está disponible ahora mismo. Inténtalo en unos minutos.")
     root_subjects = {r.subject: r for r in roots}
     inter_subjects = {c.subject: c for c in extra_certs}
     _check_leaf_usage(cert)                       # v59: hoja = persona (no CA) que puede firmar
@@ -623,6 +716,8 @@ def _mark_verified_sim(email: str, cert_ref: str) -> dict:
 def status() -> dict:
     """Diagnóstico del subsistema de certificado (para /cert/status)."""
     roots = _load_trust_roots() if _CRYPTO else []
+    installed = sorted(fn for fn, _, _ in OFFICIAL_CAS if os.path.exists(os.path.join(TRUSTDIR, fn)))
     return {"mode": MODE, "cryptography": _CRYPTO, "certvalidator": _CERTVALIDATOR,
-            "trust_roots": len(roots), "trustdir": TRUSTDIR,
-            "real_enabled": MODE in ("pilot", "strict")}
+            "trust_roots": len(roots), "official_cas": installed,
+            "official_cas_total": len(OFFICIAL_CAS),
+            "real_enabled": MODE in ("pilot", "strict") and _trust_files_ok()}
