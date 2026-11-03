@@ -58,8 +58,23 @@ def autoscript() -> bytes:
                     fh.write(data)
             except Exception:
                 pass
-        _autoscript = data
-        return data
+        _autoscript = _patch(data)
+        return _autoscript
+
+
+# Ajuste mínimo y comprobado del autoscript oficial (v65, 3-nov-2026): la «Autofirma App» actual de iPhone
+# exige recibir la operación por el servidor intermedio (fileid + rtservlet). Con peticiones cortas, el
+# autoscript las enviaba directamente en el enlace y la app respondía «AI600101 … no ha llegado la url
+# del servidor de descarga». Forzamos SIEMPRE la vía del servidor intermedio en el móvil (el enlace final,
+# que ya lleva «fileid=», sí se acepta). Solo afecta al cliente móvil; en el ordenador se usa el socket local.
+_PATCH_OLD = b"return url.length > MAX_LONG_GENERAL_URL;"
+_PATCH_NEW = b'return url.length > MAX_LONG_GENERAL_URL || url.indexOf("fileid=") === -1;'
+
+
+def _patch(data: bytes) -> bytes:
+    if data.count(_PATCH_OLD) != 1:
+        raise RuntimeError("autoscript.js: el punto de ajuste no está exactamente una vez")
+    return data.replace(_PATCH_OLD, _PATCH_NEW, 1)
 
 
 # ── 2) servidor intermedio (storage / retrieve) ─────────────────────────────────

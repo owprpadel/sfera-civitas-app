@@ -514,7 +514,7 @@ def afirma_autoscript():
         print(f"[sfera] autoscript.js no disponible: {e}", flush=True)
         raise HTTPException(503, "El componente de firma no está disponible ahora mismo. Inténtalo en unos minutos.")
     return Response(content=js, media_type="application/javascript; charset=utf-8",
-                    headers={"Cache-Control": "public, max-age=86400"})
+                    headers={"Cache-Control": "public, max-age=3600"})
 
 
 async def _afirma_params(request: Request) -> dict:

@@ -89,6 +89,13 @@ try:
 except RuntimeError:
     check(True, "fichero que no coincide con la huella: NO se sirve")
 
+fake = b"x\nfunction isURLTooLong(url) {\n return url.length > MAX_LONG_GENERAL_URL;\n}\n"
+pt = afb._patch(fake)
+check(b'url.indexOf("fileid=") === -1' in pt and pt.count(b"MAX_LONG_GENERAL_URL") == 1, "ajuste iPhone: fuerza el servidor intermedio (fileid + rtservlet)")
+try:
+    afb._patch(fake + fake); check(False, "debía rechazar")
+except RuntimeError:
+    check(True, "si el punto de ajuste no es único, no se sirve nada")
 src = open(os.path.join(os.path.dirname(__file__), "main.py"), encoding="utf-8").read()
 check('"/api/afirma/storage"' in src and '"/api/afirma/retrieve"' in src and '"/api/afirma/autoscript.js"' in src,
       "rutas del puente publicadas en la API")
