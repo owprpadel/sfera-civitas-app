@@ -9,6 +9,7 @@ ciudadanas son insumo. Sin propuestas expertas: +7 días una vez y después se d
 Ejecuta: python test_fases.py"""
 import os
 os.environ.setdefault("SFERA_CERT_SIM_ALLOWED", "1")  # simulación de certificado solo en tests
+os.environ.setdefault("SFERA_PILOT_CODES", "1")  # v64: sin correo, el código solo se devuelve con este interruptor
 import secrets
 import threading
 
@@ -230,7 +231,7 @@ lst = {x["id"]: x for x in s.list_debates()}
 check(lst[did]["phase"] == "publicar", "list_debates también pone al día (votar → publicar)")
 d = s.get_debate(did)
 res = d["election"]["result"]
-check(d["election"]["status"] == "cerrada" and res["open"]["recuento"] == [2, 1, 0, 0, 0, 1], f"recuento automático correcto {res['open']['recuento']}")
+check(d["election"]["status"] == "cerrada" and res["todos"]["recuento"] == [2, 1, 0, 0, 0, 1], f"recuento automático correcto {res['todos']['recuento']}")
 check(s.audit(eid)["recuento_reproducible"] and s.audit(eid)["cadena_integra"], "tablón íntegro y recuento reproducible")
 expect_error(lambda: votar(eid, u[3], 0), 409, "tras el cierre no se puede votar", "no está abierta")
 expect_error(lambda: s.issue_credential(eid, u[3], "12345", "open"), 409, "publicar: no se emiten credenciales", "no está abierta")
@@ -256,7 +257,7 @@ check(d["election"]["options"] == ["Abrir hasta las 22h en julio y agosto", "Abr
       "papeleta con <5 propuestas expertas: todas + «Ninguna»")
 past(did2, 1); d = s.get_debate(did2)
 check(d["phase"] == "publicar" and d["election"]["status"] == "cerrada", "cadena entera puesta al día")
-check(d["election"]["result"]["open"]["total_votos"] == 0, "recuento (vacío) publicado")
+check(d["election"]["result"]["todos"]["total_votos"] == 0, "recuento (vacío) publicado")
 
 print("8) Sin propuestas EXPERTAS: +7 días una vez, aviso y después 'sin_propuestas_expertas'")
 did3 = s.create_debate("Fuentes de agua potable en parques", "", "Medio ambiente", "Ayuntamiento", autor)["debate_id"]

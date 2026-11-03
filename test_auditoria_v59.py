@@ -3,6 +3,7 @@ Cada bloque lleva el número del hallazgo que comprueba (1-33).
 Ejecuta: python3 test_auditoria_v59.py"""
 import ast, base64, datetime, hashlib, hmac, io, json, os, re, secrets, tempfile, time, zipfile
 os.environ.setdefault("SFERA_CERT_SIM_ALLOWED", "1")
+os.environ.setdefault("SFERA_PILOT_CODES", "1")  # v64: sin correo, el código solo se devuelve con este interruptor
 DBP = "/tmp/sfera_test_auditoria_v59.db"
 os.environ["SFERA_DB"] = DBP
 os.environ.setdefault("SFERA_ADMIN_EMAILS", "aadmin@sfera.org,anuevo@sfera.org")
@@ -114,7 +115,7 @@ eid_p = s.get_debate(pdid, socio)["election"]["id"]
 rec_p = votar(eid_p, socio, 0)
 expect_error(lambda: votar(eid_p, pexp, 0, viewer=pexp), 403, "el experto asignado no vota en un espacio privado")
 res = s.close_election(eid_p, dueno)
-check(res["open"]["recuento"][0] == 1 and s.get_debate(pdid, socio)["phase"] == "publicar",
+check(res["todos"]["recuento"][0] == 1 and s.get_debate(pdid, socio)["phase"] == "publicar",
       "el organizador cierra la votación: resultado publicado")
 
 print("1) Contenido de versiones de documentos privados")
@@ -382,8 +383,10 @@ expect_error(lambda: votar(eid, u1v, 0, "verified"), 409, "20) tras verificarse 
              "Ya has pedido tu papeleta")
 s.verify_certificate("aciu2@sfera.org", "CERT:aciu2")
 u2v = s.get_user(u[2]["id"])
-expect_error(lambda: votar(eid, u2v, 0, "open"), 403, "20) cuenta con certificado: debe votar en la vía verificada", "certificado")
-check(votar(eid, u2v, 1, "verified")["via"] == "verified", "20) y en la vía verificada vota")
+sql("UPDATE users SET cert_fresh_until=? WHERE id=?", (time.time() - 1, u[2]["id"]))   # v65: firma caducada
+expect_error(lambda: votar(eid, u2v, 0, "verified"), 403, "20) v65: sin firmar con el certificado EN esta votación, no vota con certificado", "firma con tu certificado")
+s.verify_certificate("aciu2@sfera.org", "CERT:aciu2")                                   # firma justo antes de votar
+check(votar(eid, u2v, 1, "verified")["via"] == "verified", "20) firmando en esta votación, vota con certificado")
 for blinded, lbl in (("no-es-un-numero", "texto"), ("1", "b=1"), ("0", "b=0"),
                      (s.election_public(eid)["blind_pub"]["open"]["n"], "b=n")):
     expect_error(lambda: s.issue_credential(eid, u[3], blinded, "open"), 400, f"21) papeleta pedida con {lbl}: 400",

@@ -79,8 +79,12 @@ PAGE_MAX = 50
 # CUALQUIERA de las dos vías alcanza su umbral; si vence el plazo sin lograrlo,
 # caduca. Umbrales ajustables por entorno (Render) sin tocar código.
 CONV_DIAS = int(os.environ.get("SFERA_CONV_DIAS", "14"))            # plazo de convocatoria (días)
-CONV_QUORUM = int(os.environ.get("SFERA_CONV_QUORUM", "100"))       # vía ABIERTA (email): baja garantía, umbral alto
-CONV_QUORUM_VERIF = int(os.environ.get("SFERA_CONV_QUORUM_VERIF", "25"))  # vía VERIFICADA (certificado): alta garantía, umbral bajo
+# v65 (un solo universo): UN marcador de APOYOS ponderado. Cada apoyo con email suma 1 punto y
+# cada apoyo con certificado digital suma CONV_PESO_CERT (2): con certificado basta la mitad de
+# personas. El asunto avanza al llegar a CONV_QUORUM puntos. (El VOTO nunca se pondera.)
+CONV_QUORUM = int(os.environ.get("SFERA_CONV_QUORUM", "100"))       # puntos necesarios para avanzar
+CONV_PESO_CERT = int(os.environ.get("SFERA_CONV_PESO_CERT", "2"))   # un apoyo con certificado vale 2
+CONV_QUORUM_VERIF = -(-CONV_QUORUM // CONV_PESO_CERT)               # equivalente: solo con certificado (50)
 
 # ── DURACIÓN POR ASUNTO: proceso ESTÁNDAR o EXPRÉS (oct-2026) ──────────────────
 # Cada asunto guarda su propia duración por fase (debates.dias_*; NULL = estándar).
@@ -142,21 +146,40 @@ def _ext_dias(d) -> int:
 
 def _quorums(d) -> tuple:
     """(quórum vía email, quórum vía certificado) del asunto. El override solo puede rebajar."""
-    qa, qv = CONV_QUORUM, CONV_QUORUM_VERIF
+    qa = CONV_QUORUM
     q = _get(d, "quorum_override")
     if q is not None:
         try:
             q = int(q)
             if 1 <= q < qa:
-                qa = q; qv = min(qv, q)
+                qa = q
         except Exception:
             pass
-    return qa, qv
+    return qa, -(-qa // CONV_PESO_CERT)
+
+
+def _conv_points(ab: int, ve: int) -> int:
+    """v65: puntos de apoyo (email = 1, certificado = CONV_PESO_CERT)."""
+    return int(ab) + CONV_PESO_CERT * int(ve)
 
 
 def _user_via(user: dict) -> str:
     """Vía de apoyo/voto según el nivel de identidad del registro."""
     return "verificado" if (user.get("loa") == "verified") else "abierto"
+
+
+CERT_FRESH_MSG = "Para que cuente con certificado digital, firma con tu certificado justo antes (se pide en cada voto y apoyo)"
+
+
+def _take_fresh_cert(conn, user):
+    """v65: el certificado se presenta en CADA voto o apoyo. Si hay una firma con certificado
+    reciente y válida (cert_service.verify, unos minutos), se CONSUME y devuelve la huella del
+    certificado; si no, None (cuenta solo como email)."""
+    row = conn.execute("SELECT cert_pid, cert_fresh_until FROM users WHERE id=?", (user["id"],)).fetchone()
+    if not row or not row["cert_pid"] or not row["cert_fresh_until"] or float(row["cert_fresh_until"]) < db.now():
+        return None
+    cur = conn.execute("UPDATE users SET cert_fresh_until=NULL WHERE id=? AND cert_fresh_until IS NOT NULL", (user["id"],))
+    return row["cert_pid"] if cur.rowcount != 0 else None
 
 
 def _conv_counts(conn, did, deadline=None) -> tuple:
@@ -185,8 +208,8 @@ def _conv_apply(conn, d, persist=True) -> dict:
     qa, qv = _quorums(d)
     qual = d["qualified_track"] if "qualified_track" in d.keys() else None
     if phase == "convocar" and conv_status == "recabando":
-        if ab >= qa or ve >= qv:
-            qual = "verificado" if ve >= qv else "abierto"
+        if _conv_points(ab, ve) >= qa:
+            qual = "verificado" if ve >= qv else ("abierto" if ab >= qa else "mixto")
             conv_status = "avanzado"; phase = "deliberar"
             if persist:
                 # UPDATE condicional: solo avanza (y avisa) quien lo consigue primero.
@@ -218,6 +241,7 @@ def _conv_apply(conn, d, persist=True) -> dict:
         "phase": phase, "conv_status": conv_status, "qualified_track": qual,
         "apoyos_abierto": ab, "apoyos_verificado": ve,
         "quorum_abierto": qa, "quorum_verificado": qv,
+        "apoyos_puntos": _conv_points(ab, ve), "quorum_puntos": qa, "peso_certificado": CONV_PESO_CERT,
         "conv_deadline": deadline, "conv_dias_restantes": dias,
     }
 
@@ -238,6 +262,7 @@ def get_config() -> dict:
         "conv_dias": CONV_DIAS,
         "conv_quorum_abierto": CONV_QUORUM,
         "conv_quorum_verificado": CONV_QUORUM_VERIF,
+        "conv_peso_certificado": CONV_PESO_CERT,
         "plans": {"estandar": _std_dias(), "express": _express_dias()},
         "privado": billing_config(),
     }
@@ -443,7 +468,7 @@ def _on_prospera(conn, d, qual):
     proponente y se avisa (in-app + email) al Super Admin y a los admins del
     ámbito para que ASIGNEN EXPERTOS."""
     did = d["id"]; title = d["title"]
-    via_txt = "con certificado digital" if qual == "verificado" else "apoyos con email"
+    via_txt = {"verificado": "con certificado digital", "mixto": "con email y con certificado digital"}.get(qual, "con email")
     _notify(conn, d["created_by"], "prospera", did,
             f"Tu asunto «{title}» ha reunido los apoyos necesarios ({via_txt}) y pasa a Deliberar.")
     subject = f"[Sfera Civitas] Asigna expertos: «{title}»"
@@ -1011,6 +1036,9 @@ def purge_expired(now=None) -> dict:
         out["registro_ha_votado"] = X(conn, "DELETE FROM credential_issued WHERE election_id IN "
                                             "(SELECT id FROM elections WHERE status<>'abierta' AND closed_at IS NOT NULL "
                                             "AND closed_at < ?)", (now - RET_CRED_DIAS * DAY,))
+        out["certificado_ha_votado"] = X(conn, "DELETE FROM cert_votes WHERE election_id IN "
+                                               "(SELECT id FROM elections WHERE status<>'abierta' AND closed_at IS NOT NULL "
+                                               "AND closed_at < ?)", (now - RET_CRED_DIAS * DAY,))
         conn.commit()
     return out
 
@@ -1203,8 +1231,8 @@ def verify_certificate(email: str, cert_subject: str) -> dict:
         dup = conn.execute("SELECT 1 FROM users WHERE cert_pid=? AND id<>?", (pid, row["id"])).fetchone()
         if dup:
             raise SferaError(409, "Este certificado ya está vinculado a otra cuenta (una persona, una cuenta)")
-        conn.execute("UPDATE users SET loa='verified', verified=1, cert_pid=?, cert_subject=?, cert_verified_at=? WHERE id=?",
-                     (pid, db.CERT_NEUTRAL_LABEL, db.now(), row["id"]))
+        conn.execute("UPDATE users SET loa='verified', verified=1, cert_pid=?, cert_subject=?, cert_verified_at=?, cert_fresh_until=? WHERE id=?",
+                     (pid, db.CERT_NEUTRAL_LABEL, db.now(), db.now() + 600, row["id"]))
         conn.commit()
     return {"loa": "verified", "cert_subject": cert_subject}
 
@@ -1891,8 +1919,8 @@ def create_debate(title, body, materia, administracion, user, nivel="", territor
             conn.commit()
             _ia_hook(cur.lastrowid, "deliberar")   # v62: nace en Deliberar → el Participante IA también aporta
             return {"debate_id": cur.lastrowid, "phase": "deliberar", "visibility": "private", "org_id": org_id}
-        # Público: convocatoria con doble vía
-        via = _user_via(user)
+        # Público: convocatoria. v65: el apoyo del creador cuenta con certificado solo si acaba de firmar.
+        via = "verificado" if _take_fresh_cert(conn, user) else "abierto"
         cur = conn.execute(
             "INSERT INTO debates(title,body,materia,administracion,nivel,territorio,"
             "phase,visibility,created_by,conv_status,conv_deadline,created,plan,dias_conv,dias_delib,dias_prop,dias_vot,quorum_override) "
@@ -1978,7 +2006,7 @@ def support_debate(did: int, user) -> dict:
     cuenta en la vía del registro del usuario. Si con este apoyo se alcanza el
     umbral de alguna vía, el asunto avanza a Deliberar."""
     _require_verified(user)
-    via = _user_via(user)
+    via = "abierto"
     now = db.now()
     with db.session() as conn:
         _forbid_ai(user, conn)                   # v62: la IA no apoya asuntos (ni cuenta para el quórum)
@@ -1991,6 +2019,9 @@ def support_debate(did: int, user) -> dict:
             raise SferaError(409, "Este asunto no reunió los apoyos a tiempo: ya no se puede apoyar")
         already = conn.execute("SELECT 1 FROM supports WHERE debate_id=? AND user_id=?", (did, user["id"])).fetchone()
         if not already:
+            # v65: cuenta con certificado (2 puntos) solo si ha firmado con su certificado justo antes
+            if _take_fresh_cert(conn, user):
+                via = "verificado"
             try:
                 conn.execute("INSERT INTO supports(debate_id,user_id,via,created) VALUES(?,?,?,?)",
                              (did, user["id"], via, now))
@@ -2204,21 +2235,12 @@ def _tally_close(conn, e) -> dict:
     options = json.loads(e["options_json"])
     rows = conn.execute("SELECT via,payload_json FROM bulletin_board WHERE election_id=? AND kind='ballot' ORDER BY seq", (eid,)).fetchall()
     shares = [zk.TrusteeShare(x=int(xs), h=pow(cc.G, int(xs), cc.P)) for xs in json.loads(_dec(e["trustees_json"]))]
-    result = {}
-    for via in VIAS:
-        bv = [json.loads(r["payload_json"])["ballot"] for r in rows if r["via"] == via]
-        totals = _tally_via(options, bv, shares, len(bv))
-        result[via] = {"total_votos": len(bv), "opciones": options, "recuento": totals,
-                       "umbral_convocatoria": UMBRAL[via], "garantia": "alta" if via == "verified" else "abierta"}
-    result["n_custodios"] = len(shares)
-    result["nota"] = "Vías separadas por garantía; nunca se mezclan (doctrina §3.2)."
-    for via in VIAS:
-        last = conn.execute("SELECT seq,entry_hash FROM bulletin_board WHERE election_id=? ORDER BY seq DESC LIMIT 1", (eid,)).fetchone()
-        seq = last["seq"] + 1
-        payload = json.dumps({"via": via, "result": result[via]}, sort_keys=True)
-        entry_hash = cc.chain_hash(last["entry_hash"], payload)
-        conn.execute("INSERT INTO bulletin_board(election_id,seq,kind,via,payload_json,prev_hash,entry_hash,created) VALUES(?,?,?,?,?,?,?,?)",
-                     (eid, seq, "result", via, payload, last["entry_hash"], entry_hash, None))   # v64: sin hora
+    result = _tally_publish(options, rows, shares)
+    last = conn.execute("SELECT seq,entry_hash FROM bulletin_board WHERE election_id=? ORDER BY seq DESC LIMIT 1", (eid,)).fetchone()
+    payload = json.dumps({"result": result}, sort_keys=True)
+    entry_hash = cc.chain_hash(last["entry_hash"], payload)
+    conn.execute("INSERT INTO bulletin_board(election_id,seq,kind,via,payload_json,prev_hash,entry_hash,created) VALUES(?,?,?,?,?,?,?,?)",
+                 (eid, last["seq"] + 1, "result", None, payload, last["entry_hash"], entry_hash, None))   # v64: sin hora
     conn.execute("UPDATE elections SET status='cerrada', result_json=?, closed_at=? WHERE id=?",
                  (json.dumps(result), db.now(), eid))
     conn.execute("UPDATE debates SET phase='publicar', phase_deadline=NULL WHERE id=?", (e["debate_id"],))
@@ -3221,10 +3243,8 @@ def issue_credential(eid, user, blinded: str, via: str = "open") -> dict:
     _forbid_ai(user)                             # v62: la IA NUNCA vota (no recibe credencial ni papeleta)
     if via == "open" and not user["verified"]:
         raise SferaError(403, "Verifica tu email para poder votar")
-    if via == "verified" and user.get("loa") != "verified":
-        raise SferaError(403, "Para votar con certificado digital necesitas DNIe o Cl@ve (muy pronto)")
-    if user.get("loa") == "verified" and via != "verified":
-        raise SferaError(403, CERT_VIA_MSG)
+    # v65: quien tiene certificado puede votar solo con email; para que su voto cuente también
+    # «con certificado» firma con el certificado EN ESTA votación (se comprueba que sigue válido).
     with db.session() as conn:
         _forbid_ai(user, conn)
         e = _election_gate(conn, eid, user)
@@ -3239,12 +3259,24 @@ def issue_credential(eid, user, blinded: str, via: str = "open") -> dict:
         if conn.execute("SELECT 1 FROM credential_issued WHERE election_id=? AND user_id=?",
                         (eid, user["id"])).fetchone():
             raise SferaError(409, ALREADY_CRED_MSG)
+        pid = None
+        if via == "verified":                     # v65: un CERTIFICADO, un voto (aunque se borre la cuenta)
+            urow = conn.execute("SELECT cert_pid, cert_fresh_until FROM users WHERE id=?", (user["id"],)).fetchone()
+            pid = urow["cert_pid"] if urow else None
+            if not pid or not urow["cert_fresh_until"] or float(urow["cert_fresh_until"]) < db.now():
+                raise SferaError(403, CERT_FRESH_MSG)
+            if conn.execute("SELECT 1 FROM cert_votes WHERE election_id=? AND cert_pid=?", (eid, pid)).fetchone():
+                raise SferaError(409, "Este certificado digital ya ha votado en esta votación")
         d_enc = e["blind_open_d"] if via == "open" else e["blind_verified_d"]
         d = int(_dec(d_enc))
         blind_sig = pow(b, d, n)
         try:
             conn.execute("INSERT INTO credential_issued(election_id,user_id,via,issued_at) VALUES(?,?,?,?)",
                          (eid, user["id"], via, _day(db.now())))
+            if pid:
+                conn.execute("INSERT INTO cert_votes(election_id,cert_pid,issued_at) VALUES(?,?,?)",
+                             (eid, pid, _day(db.now())))
+                conn.execute("UPDATE users SET cert_fresh_until=NULL WHERE id=?", (user["id"],))   # firma de un solo uso
             conn.commit()
         except db.INTEGRITY_ERRORS:      # carrera (doble clic simultáneo): no se reutiliza la conexión
             raise SferaError(409, ALREADY_CRED_MSG)
@@ -3376,6 +3408,35 @@ def check_receipt(eid: int, code: str, user=None) -> dict:
     return {"found": False, "position": None, "total": total, "status": status, "code": receipt_code(c)}
 
 
+MIN_DESGLOSE = int(os.environ.get("SFERA_MIN_DESGLOSE", "5"))
+
+
+def _desglose_cert_publicable(n_cert: int, n_resto: int) -> bool:
+    """v65: el desglose «con certificado» solo se publica si no puede delatar a nadie: al menos
+    MIN_DESGLOSE votos con certificado y, como el resto se deduce restando, el resto también
+    tiene 0 o al menos MIN_DESGLOSE votos."""
+    return n_cert >= MIN_DESGLOSE and (n_resto == 0 or n_resto >= MIN_DESGLOSE)
+
+
+def _tally_publish(options, rows, shares) -> dict:
+    """v65 · UN SOLO UNIVERSO. Resultado = TODOS los votos (cada persona un voto, sin ponderar)
+    y, aparte, el desglose «de ellos, con certificado digital». Nunca se descifra el grupo
+    «solo email» por separado, y el desglose con certificado solo se descifra si es publicable."""
+    allb = [json.loads(r["payload_json"])["ballot"] for r in rows]
+    cert = [json.loads(r["payload_json"])["ballot"] for r in rows if r["via"] == "verified"]
+    todos = {"total_votos": len(allb), "opciones": options,
+             "recuento": _tally_via(options, allb, shares, len(allb))}
+    publicable = _desglose_cert_publicable(len(cert), len(allb) - len(cert))
+    con_cert = {"total_votos": len(cert), "opciones": options, "desglose_publicado": publicable,
+                "recuento": _tally_via(options, cert, shares, len(cert)) if publicable else None}
+    if not publicable and cert:
+        con_cert["nota"] = (f"Menos de {MIN_DESGLOSE} votos en un grupo: solo se publica el número de votos, "
+                            "para que el reparto no pueda revelar el voto de nadie.")
+    return {"formato": "v65-un-universo", "todos": todos, "con_certificado": con_cert,
+            "n_custodios": len(shares),
+            "nota": "Cada persona, un voto. El resultado es el de todos; el desglose con certificado digital es informativo."}
+
+
 def _tally_via(options, ballots_via, shares, n):
     """Recuento homomórfico de una vía: multiplica los cifrados y descifra SOLO el total."""
     totals = []
@@ -3486,11 +3547,21 @@ def _audit_compute(e, rows) -> dict:
         options = json.loads(e["options_json"])
         stored = json.loads(e["result_json"])
         recount_ok = True
-        for via in VIAS:
-            bv = ballots_by_via[via]
-            redo = _tally_via(options, bv, shares, len(bv))
-            if redo != stored[via]["recuento"]:
+        if stored.get("formato") == "v65-un-universo":
+            allb = ballots_by_via.get("open", []) + ballots_by_via.get("verified", [])
+            if _tally_via(options, allb, shares, len(allb)) != stored["todos"]["recuento"]:
                 recount_ok = False
+            cc_ = stored.get("con_certificado") or {}
+            if cc_.get("recuento") is not None:
+                bv = ballots_by_via.get("verified", [])
+                if _tally_via(options, bv, shares, len(bv)) != cc_["recuento"]:
+                    recount_ok = False
+        else:                                   # votaciones cerradas antes de v65 (dos vías)
+            for via in VIAS:
+                bv = ballots_by_via[via]
+                redo = _tally_via(options, bv, shares, len(bv))
+                if redo != stored[via]["recuento"]:
+                    recount_ok = False
     n_ballots = sum(len(v) for v in ballots_by_via.values())
     abierta = e["status"] == "abierta"
     # Estado del recuento en palabras (la web lo muestra sin «null/true»):

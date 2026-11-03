@@ -347,6 +347,15 @@ CREATE TABLE IF NOT EXISTS elections (
 );
 
 -- CAPA IDENTIDAD (desacoplada: no guarda el token; una credencial por persona/elección/VÍA)
+-- v65: «este CERTIFICADO ya ha votado en esta votación». Sin cuenta ni email: solo la huella
+-- pseudónima del certificado (HMAC del NIF). Sobrevive al borrado de la cuenta para impedir el doble
+-- voto (borrar la cuenta y verificar otra con el mismo certificado). Se purga al cierre + 90 días.
+CREATE TABLE IF NOT EXISTS cert_votes (
+  election_id INTEGER NOT NULL REFERENCES elections(id),
+  cert_pid TEXT NOT NULL,
+  issued_at {REAL},
+  PRIMARY KEY (election_id, cert_pid)
+);
 CREATE TABLE IF NOT EXISTS credential_issued (
   election_id INTEGER NOT NULL REFERENCES elections(id),
   user_id INTEGER NOT NULL REFERENCES users(id),
@@ -679,6 +688,7 @@ CERT_NEUTRAL_LABEL = "Verificado con certificado"
 
 # (tabla, columna, tipo) — se añaden si faltan. {REAL} se adapta al backend.
 _NEW_COLUMNS = [
+    ("users", "cert_fresh_until", "REAL"),            # v65: firma con certificado RECIENTE (un solo uso: un voto/apoyo)
     ("debates", "is_demo", "INTEGER DEFAULT 0"),          # caso de demostración (marcador oculto)
     ("debates", "demo_key", "TEXT"),                       # clave idempotente del caso de demostración
     ("debates", "demo_archived", "INTEGER DEFAULT 0"),    # ocultado por el botón de ejemplos (reversible)

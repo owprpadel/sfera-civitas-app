@@ -61,6 +61,7 @@ if not os.environ.get("SFERA_SECRET") and db.BACKEND == "postgres":   # v59: avi
 TRUSTDIR = os.environ.get("SFERA_CERT_TRUSTDIR",
                           os.path.join(os.path.dirname(__file__), "trust_store"))
 CHALLENGE_TTL = 300  # 5 min de validez del reto
+CERT_FRESH_TTL = int(os.environ.get("SFERA_CERT_FRESH_TTL", "600"))  # v65: la firma vale para UN voto/apoyo en 10 min
 
 # --- dependencias criptográficas (cryptography ya está en requirements) ---------
 try:
@@ -190,9 +191,12 @@ def verify(email: str, nonce_id, signature_b64: str, cert_pem: str,
                            (pid, email)).fetchone()
         if dup:
             raise CertError(409, "Este certificado ya verifica otra cuenta (una persona, una identidad)")
+        mine = conn.execute("SELECT cert_pid FROM users WHERE email=?", (email,)).fetchone()
+        if mine and mine["cert_pid"] and mine["cert_pid"] != pid:
+            raise CertError(409, "Ese certificado es de otra persona: usa el certificado con el que verificaste tu cuenta")
         conn.execute(
-            "UPDATE users SET loa='verified', verified=1, cert_pid=?, cert_subject=?, cert_verified_at=? "
-            "WHERE email=?", (pid, db.CERT_NEUTRAL_LABEL, db.now(), email))   # v64: nunca el nombre
+            "UPDATE users SET loa='verified', verified=1, cert_pid=?, cert_subject=?, cert_verified_at=?, cert_fresh_until=? "
+            "WHERE email=?", (pid, db.CERT_NEUTRAL_LABEL, db.now(), db.now() + CERT_FRESH_TTL, email))   # v64: nunca el nombre
         conn.commit()
     return {"loa": "verified", "mode": MODE, "identidad": display,
             "nota": "Identidad verificada y DESACOPLADA del voto (no se guarda el certificado ni el NIF)"}
@@ -706,8 +710,8 @@ def _mark_verified_sim(email: str, cert_ref: str) -> dict:
         dup = conn.execute("SELECT id FROM users WHERE cert_pid=? AND email<>?", (pid, email)).fetchone()
         if dup:
             raise CertError(409, "Este certificado ya verifica otra cuenta (una persona, una identidad)")
-        conn.execute("UPDATE users SET loa='verified', verified=1, cert_pid=?, cert_subject=?, cert_verified_at=? "
-                     "WHERE email=?", (pid, db.CERT_NEUTRAL_LABEL, db.now(), email))   # v64: nunca la referencia
+        conn.execute("UPDATE users SET loa='verified', verified=1, cert_pid=?, cert_subject=?, cert_verified_at=?, cert_fresh_until=? "
+                     "WHERE email=?", (pid, db.CERT_NEUTRAL_LABEL, db.now(), db.now() + CERT_FRESH_TTL, email))   # v64: nunca la referencia
         conn.commit()
     return {"loa": "verified", "mode": "sim",
             "nota": "SIMULADO (desarrollo): configura SFERA_CERT_MODE=pilot y el trust_store para validar de verdad"}

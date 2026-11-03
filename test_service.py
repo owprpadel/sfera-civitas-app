@@ -3,6 +3,7 @@ y registro con certificado digital), pruebas ZK de papeleta y custodios distribu
 Ejecuta: python test_service.py"""
 import os, secrets
 os.environ.setdefault("SFERA_CERT_SIM_ALLOWED", "1")  # simulación de certificado solo en tests
+os.environ.setdefault("SFERA_PILOT_CODES", "1")  # v64: sin correo, el código solo se devuelve con este interruptor
 os.environ["SFERA_DB"] = "/tmp/sfera_test.db"
 os.environ.setdefault("SFERA_ADMIN_EMAILS", "admin@sfera.org")  # admin para abrir/cerrar votación
 if os.path.exists("/tmp/sfera_test.db"):
@@ -108,10 +109,10 @@ except s.SferaError as e:
 
 # Fase 5: publicar (descifrado distribuido, recuentos SEPARADOS por vía)
 result = s.close_election(eid, admin)
-print("ABIERTA :", result["open"]["opciones"], "=", result["open"]["recuento"], "(umbral", result["open"]["umbral_convocatoria"], ")")
-print("VERIFIC.:", result["verified"]["opciones"], "=", result["verified"]["recuento"], "(umbral", result["verified"]["umbral_convocatoria"], ")")
-assert result["open"]["recuento"] == [6, 4], result["open"]["recuento"]
-assert result["verified"]["recuento"] == [3, 1], result["verified"]["recuento"]
+print("TODOS   :", result["todos"]["opciones"], "=", result["todos"]["recuento"])
+print("CON CERT:", result["con_certificado"]["total_votos"], "votos · desglose publicado:", result["con_certificado"]["desglose_publicado"])
+assert result["todos"]["recuento"] == [9, 5], result["todos"]["recuento"]          # v65: un solo universo (10 email + 4 cert)
+assert result["con_certificado"]["total_votos"] == 4 and result["con_certificado"]["recuento"] is None  # < 5: sin reparto
 aud = s.audit(eid)
 print("AUDITORÍA:", aud)
 assert aud["cadena_integra"] and aud["papeletas_zk_validas"] and aud["recuento_reproducible"]
