@@ -100,6 +100,12 @@ def storage(params: dict) -> str:
         dat = _err("ERR-07", "Los datos solicitados o enviados son inválidos")   # el error viaja en el fichero
     elif len(dat) > MAX_DATA:
         dat = _err("ERR-07", "Los datos solicitados o enviados son inválidos")
+    # Diagnóstico: si la app de firma devuelve un ERROR (texto «ERR-xx:=CÓDIGO - mensaje», no cifrado y sin
+    # datos personales), se anota en el log para poder ver por qué falló. Las firmas (cifradas) no se anotan.
+    if dat.startswith("ERR-") or dat.startswith("SAF_") or dat.startswith("CANCEL"):
+        print(f"[sfera] afirma: la app de firma devolvió: {dat[:200]}", flush=True)
+    else:
+        print(f"[sfera] afirma: resultado cifrado recibido ({len(dat)} caracteres)", flush=True)
     now = time.time()
     with _slock:
         _purge(now)
