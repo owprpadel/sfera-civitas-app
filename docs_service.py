@@ -436,7 +436,7 @@ def add_contribution(document_id, user, kind, text, url=None) -> dict:
         if not citizen_docs.valid_url(url):
             raise SferaError(400, "El enlace debe empezar por http:// o https:// y ser una dirección web válida")
     if kind == "enmienda" and user.get("loa") != "verified":
-        raise SferaError(403, "Para proponer cambios formales a un documento hace falta certificado digital (muy pronto)")
+        raise SferaError(403, "Para proponer cambios formales a un documento hace falta verificar tu identidad con certificado digital (en «Tu sesión»)")
     import moderation
     with db.session() as conn:
         doc = conn.execute("SELECT * FROM documents WHERE id=?", (document_id,)).fetchone()

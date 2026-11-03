@@ -58,15 +58,16 @@ _FAQ = [
      + WEB_URL + "/eliminar-cuenta.html . Si prefieres, respóndenos y lo tramitamos."),
     (r"c[oó]mo (se )?vot|votar|votaci[oó]n|emitir? (mi )?voto",
      "Cómo se vota en Sfera Civitas",
-     "El voto es cifrado, anónimo y verificable: eliges tu opción y recibes un recibo para "
-     "comprobar que tu voto está en el recuento, sin que nadie pueda saber qué votaste. "
-     "Puedes participar con acceso por email (pulso abierto) y, muy pronto, con identidad "
-     "verificada por certificado digital. Más info: " + WEB_URL),
+     "Voto cifrado y secreto: se registra que votas, no qué votas. Eliges tu opción y recibes un "
+     "comprobante para confirmar que tu voto está en la urna. Participas con tu cuenta de email y, "
+     "si quieres, también con tu certificado digital (FNMT o DNIe), que se firma en cada voto. "
+     "Más info: " + WEB_URL),
     (r"certificad\w*|dnie|autofirma|cl@ve|clave",
      "Verificación con certificado digital / DNIe",
-     "La verificación con certificado digital / DNIe (mediante AutoFirma) está en fase de "
-     "activación. Cuando esté disponible verás la opción en la app; tu identidad se "
-     "comprueba pero queda DESACOPLADA del voto (no guardamos el certificado ni tu NIF)."),
+     "Ya puedes usar tu certificado digital (FNMT o DNIe): en el ordenador con AutoFirma y en el "
+     "móvil con la app «Cliente @firma». Se firma en cada voto y en cada apoyo; el apoyo vale doble y el "
+     "resultado muestra cuántos votos fueron con certificado. No guardamos ni el certificado ni tu NIF, "
+     "solo una huella cifrada para evitar duplicados, y tu voto sigue siendo secreto."),
     (r"privad\w*|organizaci[oó]n|colectivo|empresa|asociaci[oó]n|precio|pago|coste",
      "Espacios privados (colectivos) y pago por uso",
      "Sfera Civitas ofrece espacios privados para colectivos (asociaciones, comunidades, "
