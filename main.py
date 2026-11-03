@@ -99,7 +99,7 @@ _PATTERN_LIMITS = [
     (re.compile(r"^/api/elections/\d+/cast$"), "cast",
      (int(os.environ.get("SFERA_RL_CAST", "30")), 600)),
     # v64: exportar mis datos (cada exportación recorre muchas tablas)
-    (re.compile(r"^/api/account/export$"), "export",
+    (re.compile(r"^/api/account/export(\.pdf)?$"), "export",
      (int(os.environ.get("SFERA_RL_EXPORT", "10")), 3600)),
 ]
 _HITS_MAX_KEYS = int(os.environ.get("SFERA_RL_MAX_KEYS", "50000"))   # tope de memoria del limitador
@@ -213,7 +213,7 @@ async def hide_ids_from_anonymous(request: Request, call_next):
     resp = await call_next(request)
     path = request.url.path
     if request.method != "GET" or not path.startswith("/api/") or path.startswith("/api/files/") \
-            or path == "/api/account/export":
+            or path in ("/api/account/export", "/api/account/export.pdf"):
         return resp
     if "application/json" not in (resp.headers.get("content-type") or ""):
         return resp
@@ -586,6 +586,13 @@ def export_account(u=Depends(current_user)):
     data = _wrap(s.export_account, u)
     return JSONResponse(data, headers={"Content-Disposition": 'attachment; filename="sfera-civitas-mis-datos.json"',
                                        "Cache-Control": "no-store"})
+@app.get("/api/account/export.pdf")                        # v65: los mismos datos en PDF legible
+def export_account_pdf(u=Depends(current_user)):
+    import export_pdf
+    data = _wrap(s.export_account, u)
+    return Response(content=export_pdf.build_pdf(data), media_type="application/pdf",
+                    headers={"Content-Disposition": 'attachment; filename="sfera-civitas-mis-datos.pdf"',
+                             "Cache-Control": "no-store"})
 
 
 # ── debates / fases ──────────────────────────────────────────────────────────
